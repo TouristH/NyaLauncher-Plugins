@@ -1,0 +1,11 @@
+{
+  "$schema": "./schemas/repository-v1.schema.json",
+  "schemaVersion": 1,
+  "name": "NyaLauncher Plugins",
+  "sourceUrl": "https://github.com/TouristH/NyaLauncher-Plugins",
+  "launcherUrl": "https://github.com/redstore-noob/NyaLauncher",
+  "indexPath": "public/v1/index.json",
+  "trustedReviewers": [
+    "TouristH"
+  ]
+}

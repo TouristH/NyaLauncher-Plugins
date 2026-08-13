@@ -1,0 +1,21 @@
+{
+  "$schema": "../../../schemas/catalog-release-v1.schema.json",
+  "schemaVersion": 1,
+  "version": "1.0.0",
+  "channel": "stable",
+  "publishedAt": "2026-08-13T00:00:00Z",
+  "releaseNotesUrl": "https://github.com/example/nya-toolbox/releases/tag/v1.0.0",
+  "download": {
+    "url": "https://github.com/example/nya-toolbox/releases/download/v1.0.0/dev.example.toolbox-1.0.0.zip",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "size": 123456
+  },
+  "compatibility": {
+    "manifestVersion": 1,
+    "apiVersion": "1.0",
+    "minimumLauncherVersion": "0.1.0"
+  },
+  "requiredCapabilities": [],
+  "optionalCapabilities": [],
+  "yanked": false
+}

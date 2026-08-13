@@ -1,0 +1,24 @@
+name: 插件撤回或安全下架
+description: 请求撤回某个已收录版本
+title: "[撤回] "
+labels: ["security", "yank"]
+body:
+  - type: input
+    id: plugin
+    attributes:
+      label: 插件 ID
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: 受影响版本
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: 撤回原因
+      description: 若包含未公开的可利用细节，请改用 SECURITY.md 中的私密渠道。
+    validations:
+      required: true

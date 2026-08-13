@@ -1,0 +1,18 @@
+{
+  "$schema": "../../schemas/catalog-plugin-v1.schema.json",
+  "schemaVersion": 1,
+  "id": "dev.example.toolbox",
+  "name": "Example Toolbox",
+  "description": "一句话说明插件提供的功能。",
+  "authors": [
+    "Example"
+  ],
+  "repositoryUrl": "https://github.com/example/nya-toolbox",
+  "maintainers": [
+    "example"
+  ],
+  "categories": [
+    "utilities"
+  ],
+  "license": "MIT"
+}

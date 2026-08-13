@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/index-v1.schema.json",
+  "title": "NyaLauncher generated plugin index v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "name", "sourceUrl", "plugins"],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sourceUrl": { "$ref": "#/$defs/httpsUrl" },
+    "plugins": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": { "$ref": "#/$defs/plugin" }
+    }
+  },
+  "$defs": {
+    "httpsUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://[^/@:?#]+(?::443)?(?:[/?#]|$)"
+    },
+    "githubRepo": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$"
+    },
+    "semver": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "ui.components",
+          "ui.native",
+          "network.http",
+          "system.info.read",
+          "user-files.read",
+          "user-files.write",
+          "process.start",
+          "minecraft.instance.read",
+          "minecraft.instance.modify",
+          "minecraft.launch.modify"
+        ]
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "name", "description", "authors", "repositoryUrl",
+        "maintainers", "categories", "license", "releases"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9]*(?:\\.[a-z0-9][a-z0-9-]*)+$"
+        },
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "description": { "type": "string", "maxLength": 8192 },
+        "authors": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "repositoryUrl": { "$ref": "#/$defs/githubRepo" },
+        "maintainers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "maxLength": 39,
+            "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
+          }
+        },
+        "categories": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "appearance", "automation", "gameplay", "integration",
+              "launch", "management", "utilities"
+            ]
+          }
+        },
+        "license": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "releases": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/release" }
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version", "channel", "publishedAt", "releaseNotesUrl",
+        "download", "compatibility", "requiredCapabilities",
+        "optionalCapabilities", "yanked"
+      ],
+      "properties": {
+        "version": { "$ref": "#/$defs/semver" },
+        "channel": { "enum": ["stable", "preview"] },
+        "publishedAt": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "releaseNotesUrl": { "$ref": "#/$defs/httpsUrl" },
+        "download": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["url", "sha256", "size"],
+          "properties": {
+            "url": { "$ref": "#/$defs/httpsUrl" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "size": { "type": "integer", "minimum": 1, "maximum": 268435456 }
+          }
+        },
+        "compatibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["manifestVersion", "apiVersion", "minimumLauncherVersion"],
+          "properties": {
+            "manifestVersion": { "type": "integer", "const": 1 },
+            "apiVersion": { "type": "string", "pattern": "^1(?:\\.[0-9]+){1,2}$" },
+            "minimumLauncherVersion": { "$ref": "#/$defs/semver" },
+            "maximumLauncherVersionExclusive": { "$ref": "#/$defs/semver" }
+          }
+        },
+        "requiredCapabilities": { "$ref": "#/$defs/capabilities" },
+        "optionalCapabilities": { "$ref": "#/$defs/capabilities" },
+        "yanked": { "type": "boolean" },
+        "yankReason": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "review": { "$ref": "#/$defs/review" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "yanked": { "const": true } } },
+          "then": { "required": ["yankReason"] },
+          "else": { "not": { "required": ["yankReason"] } }
+        }
+      ]
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "reviewedBy", "reviewedAt", "sha256"
+      ],
+      "properties": {
+        "status": { "const": "verified" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "reviewedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 39,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
+        },
+        "reviewedAt": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "notes": { "type": "string", "maxLength": 4096 }
+      }
+    }
+  }
+}

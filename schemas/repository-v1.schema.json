@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/repository-v1.schema.json",
+  "title": "NyaLauncher plugin repository configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "name", "sourceUrl", "launcherUrl", "indexPath", "trustedReviewers"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sourceUrl": { "$ref": "#/$defs/httpsUrl" },
+    "launcherUrl": { "$ref": "#/$defs/httpsUrl" },
+    "indexPath": { "const": "public/v1/index.json" },
+    "trustedReviewers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/githubLogin" }
+    }
+  },
+  "$defs": {
+    "httpsUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://[^/@:?#]+(?::443)?(?:[/?#]|$)"
+    },
+    "githubLogin": {
+      "type": "string",
+      "maxLength": 39,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
+    }
+  }
+}
