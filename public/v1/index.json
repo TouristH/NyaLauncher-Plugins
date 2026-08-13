@@ -2,5 +2,46 @@
   "schemaVersion": 1,
   "name": "NyaLauncher Plugins",
   "sourceUrl": "https://github.com/TouristH/NyaLauncher-Plugins",
-  "plugins": []
+  "plugins": [
+    {
+      "id": "io.github.touristh.clock",
+      "name": "电子时钟示例",
+      "description": "显示当前电脑时间的电子钟组件，可切换 24/12 小时制并控制时区和秒的显示。",
+      "authors": [
+        "TouristH"
+      ],
+      "repositoryUrl": "https://github.com/redstore-noob/NyaLauncher",
+      "maintainers": [
+        "TouristH"
+      ],
+      "categories": [
+        "utilities"
+      ],
+      "license": "MIT",
+      "releases": [
+        {
+          "version": "1.0.0",
+          "channel": "stable",
+          "publishedAt": "2026-08-13T11:59:52Z",
+          "releaseNotesUrl": "https://github.com/redstore-noob/NyaLauncher/releases/tag/clock-v1.0.0",
+          "download": {
+            "url": "https://github.com/redstore-noob/NyaLauncher/releases/download/clock-v1.0.0/io.github.touristh.clock-1.0.0.zip",
+            "sha256": "81f2dcd8edae7f63d1f6cb40c5e5ff9ecfddf196b6f540749775a2dbac7b56df",
+            "size": 14046
+          },
+          "compatibility": {
+            "manifestVersion": 1,
+            "apiVersion": "1.0",
+            "minimumLauncherVersion": "0.1.0"
+          },
+          "requiredCapabilities": [
+            "ui.components",
+            "system.info.read"
+          ],
+          "optionalCapabilities": [],
+          "yanked": false
+        }
+      ]
+    }
+  ]
 }
