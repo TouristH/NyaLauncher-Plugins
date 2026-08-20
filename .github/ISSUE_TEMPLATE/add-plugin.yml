@@ -1,20 +1,21 @@
-name: Add Plugin / 收录插件
-description: 从公开作者仓库的 _manifest.json 收录插件
+name: Queue Plugin / 插件收录兜底
+description: Topic 自动发现延迟时，将公开作者仓库加入机器人收录队列
 title: "[Plugin] "
-labels: ["plugin-submission", "pending-validation"]
+labels: ["plugin-submission", "queued-for-intake"]
 body:
   - type: markdown
     attributes:
       value: |
-        作者仓库根目录必须包含 `_manifest.json`，其升序 `releases[]` 必须保留完整发行历史，
-        每个版本均指向固定 GitHub Release ZIP。可信维护者输入 `/validate` 后才会下载本轮有界候选，
-        并核对大小、SHA-256、包内 `plugin.json` 和入口 DLL。
+        通常只需给作者仓库添加 `nyalauncher-plugin` Topic，机器人就会自动发现并收录。
+        如果 GitHub Topic 索引尚未更新，可提交此 Issue 进入同一收录队列；不需要等待管理员
+        输入 `/validate` 或 `/approve`。机器人会校验固定 Release ZIP、SHA-256、包内
+        `plugin.json` 和入口 DLL，成功后以“未审核”状态加入中心。
   - type: input
     id: plugin-id
     attributes:
       label: 插件 ID / Plugin ID
-      description: 必须与作者 `_manifest.json` 及 ZIP 内 `plugin.json` 完全一致。
-      placeholder: dev.example.toolbox
+      description: 自动收录使用 `io.github.<仓库所有者小写>.<名称>`，并与清单及 ZIP 完全一致。
+      placeholder: io.github.example.toolbox
     validations:
       required: true
   - type: input
@@ -32,7 +33,9 @@ body:
       options:
         - label: 仓库默认分支根目录包含符合模板的 `_manifest.json`
           required: true
-        - label: `_manifest.json` 的 releases[] 完整保留所有版本，且每项指向固定标签 Release ZIP
+        - label: 插件 ID 使用 `io.github.<仓库所有者小写>.` 名空间
+          required: true
+        - label: "`_manifest.json` 的 releases[] 完整保留所有版本，且每项指向固定标签 Release ZIP"
           required: true
         - label: ZIP 根目录直接包含 `plugin.json` 和入口 DLL
           required: true
@@ -40,7 +43,7 @@ body:
           required: true
         - label: 我有权发布该插件及其依赖，并已如实声明能力和风险
           required: true
-        - label: 我理解“收录”不等于“管理员已审核”，未经审核版本会向用户显示风险警告
+        - label: 我理解机器人自动收录不等于管理员审核，未经审核版本会向用户显示风险警告
           required: true
   - type: textarea
     id: notes

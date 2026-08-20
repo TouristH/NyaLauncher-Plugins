@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -160,6 +161,7 @@ class RegistryFixture:
                 "sourceUrl": "https://github.com/TouristH/NyaLauncher-Plugins",
                 "launcherUrl": "https://github.com/redstore-noob/NyaLauncher",
                 "indexPath": "public/v1/index.json",
+                "registryBotLogin": "nyalauncher-registry-bot[bot]",
                 "trustedReviewers": ["TouristH"],
             },
         )
@@ -169,6 +171,8 @@ class RegistryFixture:
                 {
                     "id": self.plugin_id,
                     "repositoryUrl": "https://github.com/example/test",
+                    "repositoryId": 1001,
+                    "ownerId": 101,
                 }
             ],
         )
@@ -217,8 +221,10 @@ class RegistryFixture:
                 "version": self.version,
                 "sha256": self.sha256,
                 "status": "verified",
-                "reviewer": "TouristH",
-                "reviewedAt": "2026-08-13T00:00:00Z",
+                "stateBy": "TouristH",
+                "stateAt": "2026-08-13T00:00:00Z",
+                "lastCommandAt": "2026-08-13T00:00:00Z",
+                "lastCommentId": 123456789,
                 "notes": "Exact artifact reviewed.",
             },
         )
@@ -595,6 +601,7 @@ class StrictContractTests(unittest.TestCase):
                 "sourceUrl": "https://gitlab.com/example/registry",
                 "launcherUrl": "https://github.com/redstore-noob/NyaLauncher",
                 "indexPath": "public/v1/index.json",
+                "registryBotLogin": "nyalauncher-registry-bot[bot]",
                 "trustedReviewers": ["TouristH"],
             }
             write_json(root / "repository.json", configuration)
@@ -699,6 +706,82 @@ class PublisherManifestTests(unittest.TestCase):
         manifest["id"] = "dev.example.other"
         with self.assertRaises(ValidationFailure):
             validator.validate_publisher_manifest(manifest, self.listing)
+
+    def test_github_numeric_identity_rejects_reclaimed_repository_path(self):
+        metadata = {
+            "id": 2002,
+            "html_url": "https://github.com/example/test",
+            "owner": {"id": 202},
+            "private": False,
+            "fork": False,
+            "archived": False,
+            "disabled": False,
+        }
+        repository_id, owner_id, repository_url = (
+            validator.validate_github_repository_identity(
+                metadata,
+                "https://github.com/example/test",
+                "fixture",
+            )
+        )
+        self.assertEqual((repository_id, owner_id), (2002, 202))
+        self.assertEqual(repository_url, "https://github.com/example/test")
+
+        reclaimed = dict(metadata)
+        reclaimed["html_url"] = "https://github.com/attacker/test"
+        with self.assertRaises(ValidationFailure):
+            validator.validate_github_repository_identity(
+                reclaimed,
+                "https://github.com/example/test",
+                "fixture",
+            )
+
+    def test_http_availability_errors_are_retryable_but_not_found_is_not(self):
+        for code, headers in (
+            (429, {}),
+            (503, {}),
+            (403, {"X-RateLimit-Remaining": "0"}),
+            (403, {"Retry-After": "60"}),
+        ):
+            with self.subTest(code=code, headers=headers):
+                error = urllib.error.HTTPError(
+                    "https://api.github.com/test", code, "failed", headers, None
+                )
+                try:
+                    self.assertTrue(validator.is_retryable_http_error(error))
+                finally:
+                    error.close()
+        not_found = urllib.error.HTTPError(
+            "https://api.github.com/test", 404, "not found", {}, None
+        )
+        try:
+            self.assertFalse(validator.is_retryable_http_error(not_found))
+        finally:
+            not_found.close()
+
+    def test_manifest_timeout_is_availability_failure_but_404_is_hard_failure(self):
+        with patch.object(validator.urllib.request, "build_opener") as build_opener:
+            build_opener.return_value.open.side_effect = TimeoutError("timed out")
+            with self.assertRaises(validator.AvailabilityFailure):
+                validator.fetch_repository_manifest(
+                    "https://github.com/example/test", "fixture"
+                )
+
+        not_found = urllib.error.HTTPError(
+            "https://raw.githubusercontent.com/example/test/HEAD/_manifest.json",
+            404,
+            "not found",
+            {},
+            None,
+        )
+        with patch.object(validator.urllib.request, "build_opener") as build_opener:
+            build_opener.return_value.open.side_effect = not_found
+            with self.assertRaises(ValidationFailure) as raised:
+                validator.fetch_repository_manifest(
+                    "https://github.com/example/test", "fixture"
+                )
+        not_found.close()
+        self.assertNotIsInstance(raised.exception, validator.AvailabilityFailure)
 
 
 class PublisherRefreshTests(unittest.TestCase):
@@ -899,7 +982,7 @@ class PublisherRefreshTests(unittest.TestCase):
         self.assertEqual(calls[1][1]["maximum_candidates"], 1)
         self.assertEqual(calls[1][1]["maximum_candidate_bytes"], 50)
 
-    def test_invalid_best_effort_publisher_does_not_consume_global_budget(self):
+    def test_invalid_manifest_before_download_does_not_consume_global_budget(self):
         catalog = [
             {"id": f"dev.example.{suffix}", "releases": []}
             for suffix in ("a", "b")
@@ -933,6 +1016,101 @@ class PublisherRefreshTests(unittest.TestCase):
         self.assertEqual(len(budgets), 2)
         self.assertEqual(budgets[0], budgets[1])
 
+    def test_failed_candidate_download_consumes_global_budget(self):
+        catalog = [
+            {"id": f"dev.example.{suffix}", "releases": []}
+            for suffix in ("a", "b")
+        ]
+        listings = [
+            {
+                "id": plugin["id"],
+                "repositoryUrl": f"https://github.com/example/{plugin['id'][-1]}",
+            }
+            for plugin in catalog
+        ]
+        budgets = []
+
+        def merge(by_id, listing, **budget):
+            budgets.append(budget)
+            if listing["id"].endswith(".a"):
+                raise validator.PublisherCandidateFailure(
+                    "second ZIP failed", attempted_count=2, attempted_bytes=200
+                )
+            return None, []
+
+        with (
+            patch.object(validator, "load_catalog", return_value=catalog),
+            patch.object(validator, "merge_publisher_snapshot", side_effect=merge),
+            patch.object(validator, "emit_refresh_warning"),
+            patch.object(validator, "MAXIMUM_NEW_RELEASE_COUNT", 3),
+            patch.object(validator, "MAXIMUM_NEW_RELEASE_BYTES", 250),
+            patch.dict(
+                validator.os.environ,
+                {"NYA_REFRESH_OFFSET": "0", "NYA_REFRESH_TARGET": ""},
+            ),
+        ):
+            validator.refresh_details(listings, [], best_effort=True)
+
+        self.assertEqual(len(budgets), 2)
+        self.assertEqual(budgets[0]["maximum_candidates"], 3)
+        self.assertEqual(budgets[0]["maximum_candidate_bytes"], 250)
+        self.assertEqual(budgets[1]["maximum_candidates"], 1)
+        self.assertEqual(budgets[1]["maximum_candidate_bytes"], 50)
+
+    def test_failed_discovery_batch_cannot_consume_active_publisher_zip_reserve(self):
+        new_id = "io.github.alice.new"
+        active_id = "dev.example.active"
+        catalog = [{"id": active_id, "releases": []}]
+        listings = [
+            {
+                "id": new_id,
+                "repositoryUrl": "https://github.com/alice/new",
+            },
+            {
+                "id": active_id,
+                "repositoryUrl": "https://github.com/example/active",
+            },
+        ]
+        calls = []
+        retryable_failures = set()
+
+        def merge(_by_id, listing, **budget):
+            calls.append((listing["id"], budget))
+            if listing["id"] == new_id:
+                raise validator.PublisherCandidateFailure(
+                    "Topic ZIP download timed out",
+                    attempted_count=8,
+                    attempted_bytes=256,
+                    retryable=True,
+                )
+            return None, []
+
+        with (
+            patch.object(validator, "load_catalog", return_value=catalog),
+            patch.object(validator, "merge_publisher_snapshot", side_effect=merge),
+            patch.object(validator, "emit_refresh_warning"),
+            patch.object(validator, "MAXIMUM_NEW_RELEASE_COUNT", 16),
+            patch.object(validator, "MAXIMUM_NEW_RELEASE_BYTES", 512),
+            patch.dict(
+                validator.os.environ,
+                {"NYA_REFRESH_OFFSET": "0", "NYA_REFRESH_TARGET": ""},
+            ),
+        ):
+            validator.refresh_details(
+                listings,
+                [],
+                best_effort=True,
+                priority_ids=[new_id],
+                retryable_failures=retryable_failures,
+            )
+
+        self.assertEqual([item[0] for item in calls], [new_id, active_id])
+        self.assertEqual(calls[0][1]["maximum_candidates"], 8)
+        self.assertEqual(calls[0][1]["maximum_candidate_bytes"], 256)
+        self.assertEqual(calls[1][1]["maximum_candidates"], 8)
+        self.assertEqual(calls[1][1]["maximum_candidate_bytes"], 256)
+        self.assertEqual(retryable_failures, {new_id})
+
     def test_refresh_order_rotates_known_publishers_after_new_active_plugins(self):
         listings = [
             {"id": "dev.example.a"},
@@ -951,6 +1129,27 @@ class PublisherRefreshTests(unittest.TestCase):
         self.assertEqual(
             [listing["id"] for listing in ordered],
             ["dev.example.new", "dev.example.b", "dev.example.a"],
+        )
+
+    def test_explicit_refresh_priority_precedes_lexical_new_plugin_order(self):
+        listings = [
+            {"id": "io.github.alice.topic"},
+            {"id": "io.github.zed.issue"},
+            {"id": "dev.example.known"},
+        ]
+        catalog = [{"id": "dev.example.known"}]
+        with patch.dict(
+            validator.os.environ,
+            {"NYA_REFRESH_OFFSET": "0", "NYA_REFRESH_TARGET": ""},
+        ):
+            ordered = validator.order_refresh_listings(
+                listings,
+                catalog,
+                ["io.github.zed.issue", "io.github.alice.topic"],
+            )
+        self.assertEqual(
+            [listing["id"] for listing in ordered],
+            ["io.github.zed.issue", "io.github.alice.topic", "dev.example.known"],
         )
 
     def test_refresh_target_is_first_even_when_it_is_known(self):
@@ -1272,6 +1471,21 @@ class RegistryGenerationTests(unittest.TestCase):
                 fixture.sha256,
             )
 
+    def test_revoked_review_record_is_kept_out_of_public_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            review = json.loads(fixture.review_path.read_text(encoding="utf-8"))
+            review["status"] = "revoked"
+            review["stateAt"] = "2026-08-14T00:00:00Z"
+            review["lastCommandAt"] = "2026-08-14T00:00:00Z"
+            review["lastCommentId"] = 123456790
+            review["notes"] = "Administrator revoked the green marker."
+            write_json(fixture.review_path, review)
+
+            index = self.build_fixture(fixture)
+
+            self.assertNotIn("review", index["plugins"][0]["releases"][0])
+
     def test_review_hash_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
@@ -1319,7 +1533,7 @@ class RegistryGenerationTests(unittest.TestCase):
             with self.assertRaises(ValidationFailure):
                 self.build_fixture(fixture)
 
-    def test_active_plugin_list_contains_only_id_and_repository_url(self):
+    def test_active_plugin_list_contains_only_publisher_identity_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
             write_json(
@@ -1328,12 +1542,32 @@ class RegistryGenerationTests(unittest.TestCase):
                     {
                         "id": fixture.plugin_id,
                         "repositoryUrl": "https://github.com/example/test",
+                        "repositoryId": 1001,
+                        "ownerId": 101,
                         "name": "Metadata belongs in the publisher manifest",
                     }
                 ],
             )
             with self.assertRaises(ValidationFailure):
                 self.build_fixture(fixture)
+
+    def test_active_plugin_list_requires_numeric_github_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            write_json(
+                fixture.root / "plugins.json",
+                [
+                    {
+                        "id": fixture.plugin_id,
+                        "repositoryUrl": "https://github.com/example/test",
+                    }
+                ],
+            )
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                self.assertRaises(ValidationFailure),
+            ):
+                validator.load_plugin_list()
 
     def test_archived_plugin_is_allowed_when_every_release_is_yanked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1349,6 +1583,18 @@ class RegistryGenerationTests(unittest.TestCase):
             self.assertEqual(index["plugins"][0]["id"], fixture.plugin_id)
             self.assertTrue(index["plugins"][0]["releases"][0]["yanked"])
 
+    def test_monitored_publisher_pointer_is_kept_when_all_releases_are_yanked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            release = json.loads(fixture.release_path.read_text(encoding="utf-8"))
+            release["yanked"] = True
+            release["yankReason"] = "Awaiting a fixed release."
+            write_json(fixture.release_path, release)
+
+            index = self.build_fixture(fixture)
+
+            self.assertTrue(index["plugins"][0]["releases"][0]["yanked"])
+
     def test_archived_plugin_with_an_active_release_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
@@ -1360,7 +1606,7 @@ class RegistryGenerationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
             review = json.loads(fixture.review_path.read_text(encoding="utf-8"))
-            review["reviewer"] = "NotTrusted"
+            review["stateBy"] = "NotTrusted"
             write_json(fixture.review_path, review)
             with self.assertRaises(ValidationFailure):
                 self.build_fixture(fixture)

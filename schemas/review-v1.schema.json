@@ -10,8 +10,10 @@
     "version",
     "sha256",
     "status",
-    "reviewer",
-    "reviewedAt"
+    "stateBy",
+    "stateAt",
+    "lastCommandAt",
+    "lastCommentId"
   ],
   "properties": {
     "$schema": { "type": "string" },
@@ -23,12 +25,22 @@
     },
     "version": { "$ref": "#/$defs/semver" },
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-    "status": { "const": "verified" },
-    "reviewer": { "$ref": "#/$defs/githubLogin" },
-    "reviewedAt": {
+    "status": { "enum": ["verified", "revoked"] },
+    "stateBy": { "$ref": "#/$defs/githubLogin" },
+    "stateAt": {
       "type": "string",
       "format": "date-time",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "lastCommandAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "lastCommentId": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
     },
     "notes": { "type": "string", "maxLength": 4096 }
   },

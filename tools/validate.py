@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Validate, refresh, and deterministically publish the NyaLauncher registry.
 
-``plugins.json`` contains only active publisher pointers.  Each publisher owns
+``plugins.json`` contains monitored publisher pointers and immutable GitHub
+numeric identities. Each publisher owns
 a root ``_manifest.json`` with stable metadata and a bounded complete
 ``releases[]`` history of fixed GitHub Release ZIPs.  Missing releases are
 validated in bounded batches and appended to ``plugins/<id>/releases``, the
@@ -56,6 +57,9 @@ SEMVER = re.compile(
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GITHUB_REPO = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/?$")
 GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+GITHUB_APP_BOT_LOGIN = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\[bot\]$"
+)
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 API_VERSION = re.compile(r"^1(?:\.[0-9]+){1,2}$")
 KNOWN_CAPABILITIES = {
@@ -132,6 +136,42 @@ _MISSING = object()
 
 class ValidationFailure(Exception):
     """A registry input violates the publication contract."""
+
+
+class AvailabilityFailure(ValidationFailure):
+    """A remote dependency was temporarily unavailable; retry is appropriate."""
+
+
+class PublisherCandidateFailure(ValidationFailure):
+    """A candidate batch failed after consuming bounded download resources."""
+
+    def __init__(
+        self,
+        message: str,
+        attempted_count: int,
+        attempted_bytes: int,
+        *,
+        retryable: bool = False,
+    ):
+        super().__init__(message)
+        self.attempted_count = attempted_count
+        self.attempted_bytes = attempted_bytes
+        self.retryable = retryable
+
+
+def is_retryable_http_error(exc: urllib.error.HTTPError) -> bool:
+    """Classify bounded remote availability failures without hiding bad input."""
+
+    if exc.code in {408, 425, 429} or 500 <= exc.code <= 599:
+        return True
+    if exc.code != 403:
+        return False
+    headers = exc.headers
+    if headers is None:
+        return False
+    retry_after = headers.get("Retry-After")
+    remaining = headers.get("X-RateLimit-Remaining")
+    return bool(isinstance(retry_after, str) and retry_after.strip()) or remaining == "0"
 
 
 def source_name(source: Path | str) -> str:
@@ -549,6 +589,86 @@ def same_github_repository(left: str, right: str) -> bool:
     )
 
 
+def validate_github_repository_identity(
+    value: object,
+    repository_url: str,
+    source: Path | str,
+) -> tuple[int, int, str]:
+    """Bind a mutable owner/name path to GitHub's immutable numeric identities."""
+
+    if not isinstance(value, dict):
+        raise ValidationFailure(f"{source_name(source)}: GitHub 仓库信息必须是对象")
+    repository_id = value.get("id")
+    owner = value.get("owner")
+    owner_id = owner.get("id") if isinstance(owner, dict) else None
+    html_url = value.get("html_url")
+    if (
+        type(repository_id) is not int
+        or not 1 <= repository_id <= 2**63 - 1
+        or type(owner_id) is not int
+        or not 1 <= owner_id <= 2**63 - 1
+        or not isinstance(html_url, str)
+    ):
+        raise ValidationFailure(f"{source_name(source)}: GitHub numeric repository identity 无效")
+    _, _, canonical_url = github_repository_parts(source, "html_url", html_url)
+    if not same_github_repository(canonical_url, repository_url):
+        raise ValidationFailure(
+            f"{source_name(source)}: GitHub 仓库路径已重命名、转移或被其他仓库接管，需人工迁移"
+        )
+    if (
+        value.get("private") is not False
+        or value.get("fork") is not False
+        or value.get("archived") is not False
+        or value.get("disabled") is True
+    ):
+        raise ValidationFailure(
+            f"{source_name(source)}: 自动发布仓库必须公开、非 Fork、未归档且可用"
+        )
+    return repository_id, owner_id, canonical_url
+
+
+def fetch_github_repository_identity(
+    repository_url: str, source: Path | str
+) -> tuple[int, int, str]:
+    owner, repository, canonical_url = github_repository_parts(
+        source, "repositoryUrl", repository_url
+    )
+    request = urllib.request.Request(
+        "https://api.github.com/repos/"
+        f"{quote(owner, safe='')}/{quote(repository, safe='')}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "NyaLauncher-Plugins-Validator/2.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read(MAXIMUM_MANIFEST_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        failure = AvailabilityFailure if is_retryable_http_error(exc) else ValidationFailure
+        raise failure(
+            f"{source_name(source)}: 无法核验 GitHub 仓库身份：HTTP {exc.code}"
+        ) from exc
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
+        raise AvailabilityFailure(
+            f"{source_name(source)}: 无法核验 GitHub 仓库身份：{exc}"
+        ) from exc
+    if len(payload) > MAXIMUM_MANIFEST_BYTES:
+        raise ValidationFailure(f"{source_name(source)}: GitHub 仓库身份响应超过 1 MiB")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeError as exc:
+        raise ValidationFailure(
+            f"{source_name(source)}: GitHub 仓库身份响应必须是 UTF-8"
+        ) from exc
+    value = parse_json_object(text, f"{source_name(source)}::GitHub API")
+    return validate_github_repository_identity(value, canonical_url, source)
+
+
 def validate_fixed_release_zip(
     source: Path | str, repository_url: str, value: object
 ) -> str:
@@ -645,24 +765,46 @@ def load_plugin_list() -> list[dict]:
     result: list[dict] = []
     seen_ids: set[str] = set()
     seen_repositories: set[str] = set()
+    seen_repository_ids: set[int] = set()
     for index, value in enumerate(values):
         source = f"plugins.json[{index}]"
         if not isinstance(value, dict):
             raise ValidationFailure(f"{source}: 条目必须是对象")
-        require_exact_keys(source, value, {"id", "repositoryUrl"}, set())
+        require_exact_keys(
+            source,
+            value,
+            {"id", "repositoryUrl", "repositoryId", "ownerId"},
+            set(),
+        )
         plugin_id = require_text(source, "id", value["id"], 128)
         if PLUGIN_ID.fullmatch(plugin_id) is None:
             raise ValidationFailure(f"{source}: id 必须是小写反向域名")
         _, _, repository_url = github_repository_parts(
             source, "repositoryUrl", value["repositoryUrl"]
         )
+        repository_id = value["repositoryId"]
+        owner_id = value["ownerId"]
+        if type(repository_id) is not int or not 1 <= repository_id <= 2**63 - 1:
+            raise ValidationFailure(f"{source}: repositoryId 必须是正 Int64")
+        if type(owner_id) is not int or not 1 <= owner_id <= 2**63 - 1:
+            raise ValidationFailure(f"{source}: ownerId 必须是正 Int64")
         if plugin_id.casefold() in seen_ids:
             raise ValidationFailure(f"{source}: 插件 ID 重复")
         if repository_url.casefold() in seen_repositories:
             raise ValidationFailure(f"{source}: 同一发布仓库不能重复收录")
+        if repository_id in seen_repository_ids:
+            raise ValidationFailure(f"{source}: 同一 GitHub repositoryId 不能重复收录")
         seen_ids.add(plugin_id.casefold())
         seen_repositories.add(repository_url.casefold())
-        result.append({"id": plugin_id, "repositoryUrl": repository_url})
+        seen_repository_ids.add(repository_id)
+        result.append(
+            {
+                "id": plugin_id,
+                "repositoryUrl": repository_url,
+                "repositoryId": repository_id,
+                "ownerId": owner_id,
+            }
+        )
     return sorted(result, key=lambda item: item["id"].casefold())
 
 
@@ -692,17 +834,17 @@ class ManifestRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, target)
 
 
-def fetch_publisher_manifest(listing: dict) -> dict:
-    """Fetch one publisher's root _manifest.json from its default branch."""
+def fetch_repository_manifest(repository_url: str, source: str) -> dict:
+    """Fetch an unbound repository's root ``_manifest.json`` safely.
 
-    if not isinstance(listing, dict):
-        raise ValidationFailure("发布条目必须是对象")
-    require_exact_keys("publisher listing", listing, {"id", "repositoryUrl"}, set())
-    plugin_id = require_text("publisher listing", "id", listing["id"], 128)
-    if PLUGIN_ID.fullmatch(plugin_id) is None:
-        raise ValidationFailure("publisher listing: id 必须是小写反向域名")
+    Discovery needs to read the manifest before it knows the claimed plugin
+    ID.  Keeping that fetch here makes it use the same host, redirect, size,
+    timeout, UTF-8, and duplicate-key rules as normal publisher refreshes.
+    """
+
+    source = require_text("repository manifest", "source", source, 2048)
     owner, repository, _ = github_repository_parts(
-        "publisher listing", "repositoryUrl", listing["repositoryUrl"]
+        source, "repositoryUrl", repository_url
     )
     url = (
         "https://raw.githubusercontent.com/"
@@ -719,30 +861,64 @@ def fetch_publisher_manifest(listing: dict) -> dict:
     try:
         with opener.open(request, timeout=30) as response:
             if not is_allowed_manifest_url(response.geturl()):
-                raise ValidationFailure(f"{listing['id']}: 发布清单最终地址不受允许")
+                raise ValidationFailure(f"{source}: 发布清单最终地址不受允许")
             content_length = response.headers.get("Content-Length")
             if content_length is not None:
                 try:
                     if int(content_length) > MAXIMUM_MANIFEST_BYTES:
-                        raise ValidationFailure(f"{listing['id']}: _manifest.json 超过 1 MiB")
+                        raise ValidationFailure(f"{source}: _manifest.json 超过 1 MiB")
                 except ValueError as exc:
                     raise ValidationFailure(
-                        f"{listing['id']}: _manifest.json Content-Length 无效"
+                        f"{source}: _manifest.json Content-Length 无效"
                     ) from exc
             payload = response.read(MAXIMUM_MANIFEST_BYTES + 1)
     except ValidationFailure:
         raise
+    except urllib.error.HTTPError as exc:
+        failure = AvailabilityFailure if is_retryable_http_error(exc) else ValidationFailure
+        raise failure(
+            f"{source}: 无法读取发布仓库根目录 _manifest.json：HTTP {exc.code}"
+        ) from exc
     except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
-        raise ValidationFailure(
-            f"{listing['id']}: 无法读取发布仓库根目录 _manifest.json：{exc}"
+        raise AvailabilityFailure(
+            f"{source}: 无法读取发布仓库根目录 _manifest.json：{exc}"
         ) from exc
     if len(payload) > MAXIMUM_MANIFEST_BYTES:
-        raise ValidationFailure(f"{listing['id']}: _manifest.json 超过 1 MiB")
+        raise ValidationFailure(f"{source}: _manifest.json 超过 1 MiB")
     try:
         text = payload.decode("utf-8")
     except UnicodeError as exc:
-        raise ValidationFailure(f"{listing['id']}: _manifest.json 必须是 UTF-8") from exc
-    return parse_json_object(text, f"{listing['id']}::_manifest.json")
+        raise ValidationFailure(f"{source}: _manifest.json 必须是 UTF-8") from exc
+    return parse_json_object(text, f"{source}::_manifest.json")
+
+
+def fetch_publisher_manifest(listing: dict) -> dict:
+    """Fetch one publisher's root _manifest.json from its default branch."""
+
+    if not isinstance(listing, dict):
+        raise ValidationFailure("发布条目必须是对象")
+    require_exact_keys(
+        "publisher listing",
+        listing,
+        {"id", "repositoryUrl"},
+        {"repositoryId", "ownerId"},
+    )
+    plugin_id = require_text("publisher listing", "id", listing["id"], 128)
+    if PLUGIN_ID.fullmatch(plugin_id) is None:
+        raise ValidationFailure("publisher listing: id 必须是小写反向域名")
+    has_repository_id = "repositoryId" in listing
+    has_owner_id = "ownerId" in listing
+    if has_repository_id != has_owner_id:
+        raise ValidationFailure("publisher listing: repositoryId 与 ownerId 必须同时存在")
+    if has_repository_id:
+        repository_id, owner_id, _ = fetch_github_repository_identity(
+            listing["repositoryUrl"], plugin_id
+        )
+        if repository_id != listing["repositoryId"] or owner_id != listing["ownerId"]:
+            raise ValidationFailure(
+                f"{plugin_id}: GitHub numeric repository identity 已变化，拒绝自动同步"
+            )
+    return fetch_repository_manifest(listing["repositoryUrl"], plugin_id)
 
 
 def validate_publisher_release(
@@ -1146,8 +1322,10 @@ def validate_review(
             "version",
             "sha256",
             "status",
-            "reviewer",
-            "reviewedAt",
+            "stateBy",
+            "stateAt",
+            "lastCommandAt",
+            "lastCommentId",
         },
         {"$schema", "notes"},
     )
@@ -1165,20 +1343,31 @@ def validate_review(
         raise ValidationFailure(
             f"{source_name(path)}: sha256 必须与被审核 Release 的固定哈希完全一致"
         )
-    if not isinstance(value["status"], str) or value["status"] != "verified":
-        raise ValidationFailure(f"{source_name(path)}: status 只能是 verified")
-    reviewer = require_text(path, "reviewer", value["reviewer"], 39)
-    if GITHUB_LOGIN.fullmatch(reviewer) is None or reviewer.casefold() not in trusted_reviewers:
-        raise ValidationFailure(f"{source_name(path)}: reviewer 不在 trustedReviewers 中")
-    reviewed_at = validate_utc_timestamp(path, "reviewedAt", value["reviewedAt"])
+    status = value["status"]
+    if not isinstance(status, str) or status not in {"verified", "revoked"}:
+        raise ValidationFailure(f"{source_name(path)}: status 必须是 verified 或 revoked")
+    state_by = require_text(path, "stateBy", value["stateBy"], 39)
+    if GITHUB_LOGIN.fullmatch(state_by) is None or state_by.casefold() not in trusted_reviewers:
+        raise ValidationFailure(f"{source_name(path)}: stateBy 不在 trustedReviewers 中")
+    state_at = validate_utc_timestamp(path, "stateAt", value["stateAt"])
+    last_command_at = validate_utc_timestamp(
+        path, "lastCommandAt", value["lastCommandAt"]
+    )
+    last_comment_id = value["lastCommentId"]
+    if type(last_comment_id) is not int or not (1 <= last_comment_id <= 2**63 - 1):
+        raise ValidationFailure(f"{source_name(path)}: lastCommentId 必须是正 Int64")
+    if last_command_at < state_at:
+        raise ValidationFailure(f"{source_name(path)}: lastCommandAt 不能早于 stateAt")
     notes = None
     if "notes" in value:
         notes = require_text(path, "notes", value["notes"], 4096, allow_empty=True)
     result = {
-        "status": "verified",
+        "status": status,
         "sha256": sha256,
-        "reviewedBy": reviewer,
-        "reviewedAt": reviewed_at,
+        "stateBy": state_by,
+        "stateAt": state_at,
+        "lastCommandAt": last_command_at,
+        "lastCommentId": last_comment_id,
     }
     if notes is not None:
         result["notes"] = notes
@@ -1197,6 +1386,7 @@ def load_repository_configuration() -> tuple[dict, set[str]]:
             "sourceUrl",
             "launcherUrl",
             "indexPath",
+            "registryBotLogin",
             "trustedReviewers",
         },
         {"$schema"},
@@ -1212,6 +1402,9 @@ def load_repository_configuration() -> tuple[dict, set[str]]:
     _, _, source_url = github_repository_parts(path, "sourceUrl", value["sourceUrl"])
     value["sourceUrl"] = source_url
     require_https(path, "launcherUrl", value["launcherUrl"])
+    bot_login = require_text(path, "registryBotLogin", value["registryBotLogin"], 44)
+    if GITHUB_APP_BOT_LOGIN.fullmatch(bot_login) is None:
+        raise ValidationFailure("repository.json: registryBotLogin 必须是 GitHub App [bot] 登录名")
     reviewers = require_list_of_text(
         path,
         "trustedReviewers",
@@ -1258,17 +1451,26 @@ def attach_reviews(result_plugins: list[dict], trusted_reviewers: set[str]) -> N
                 raise ValidationFailure(f"{source_name(review_path)}: 没有对应的中心历史版本")
             if "review" in release:
                 raise ValidationFailure(f"{source_name(review_path)}: 版本审核重复")
-            review = validate_review(
+            review_record = validate_review(
                 review_path,
                 plugin_id,
                 version,
                 release["download"]["sha256"],
                 trusted_reviewers,
             )
-            # A yanked release is never shown as verified even if an old, valid
-            # administrator record remains in history.
-            if not release["yanked"]:
-                release["review"] = review
+            # Revocation records remain durable ordering tombstones but never
+            # enter the launcher contract. A yanked release is likewise never
+            # shown as verified.
+            if review_record["status"] == "verified" and not release["yanked"]:
+                public_review = {
+                    "status": "verified",
+                    "sha256": review_record["sha256"],
+                    "reviewedBy": review_record["stateBy"],
+                    "reviewedAt": review_record["stateAt"],
+                }
+                if "notes" in review_record:
+                    public_review["notes"] = review_record["notes"]
+                release["review"] = public_review
 
 
 def build_details() -> list[dict]:
@@ -1298,10 +1500,6 @@ def validate_active_catalog(listings: list[dict], plugins: list[dict]) -> None:
         if not same_github_repository(plugin["repositoryUrl"], listing["repositoryUrl"]):
             raise ValidationFailure(
                 f"{plugin_id}: plugins.json repositoryUrl 与中心历史仓库不一致"
-            )
-        if not any(not release["yanked"] for release in plugin["releases"]):
-            raise ValidationFailure(
-                f"{plugin_id}: active 插件必须至少有一个未撤回历史版本"
             )
 
 
@@ -1533,8 +1731,20 @@ def merge_publisher_snapshot(
 
     # Verify every missing ZIP before mutating even the in-memory central view.
     # refresh_details writes only after all publishers have been planned.
+    attempted_count = 0
+    attempted_bytes = 0
     for release in candidates:
-        verify_new_release_candidate(plugin, release)
+        attempted_count += 1
+        attempted_bytes += release["download"]["size"]
+        try:
+            verify_new_release_candidate(plugin, release)
+        except ValidationFailure as exc:
+            raise PublisherCandidateFailure(
+                str(exc),
+                attempted_count,
+                attempted_bytes,
+                retryable=isinstance(exc, AvailabilityFailure),
+            ) from exc
 
     if existing is None:
         merged = copy.deepcopy(plugin)
@@ -1558,7 +1768,9 @@ def emit_refresh_warning(message: str) -> None:
 
 
 def order_refresh_listings(
-    listings: list[dict], catalog: list[dict]
+    listings: list[dict],
+    catalog: list[dict],
+    priority_ids: list[str] | None = None,
 ) -> list[dict]:
     """Prioritize an approval target/new pointers, then rotate publishers."""
 
@@ -1573,12 +1785,26 @@ def order_refresh_listings(
         # publisher latency prevent its already-validated request from landing.
         return matches
 
+    priority_rank = {
+        plugin_id.casefold(): index
+        for index, plugin_id in enumerate(priority_ids or [])
+    }
+    prioritized = sorted(
+        (
+            listing
+            for listing in listings
+            if listing["id"].casefold() in priority_rank
+        ),
+        key=lambda item: priority_rank[item["id"].casefold()],
+    )
+    prioritized_ids = {listing["id"].casefold() for listing in prioritized}
     catalog_ids = {plugin["id"].casefold() for plugin in catalog}
     new_listings = sorted(
         (
             listing
             for listing in listings
             if listing["id"].casefold() not in catalog_ids
+            and listing["id"].casefold() not in prioritized_ids
         ),
         key=lambda item: item["id"].casefold(),
     )
@@ -1587,6 +1813,7 @@ def order_refresh_listings(
             listing
             for listing in listings
             if listing["id"].casefold() in catalog_ids
+            and listing["id"].casefold() not in prioritized_ids
         ),
         key=lambda item: item["id"].casefold(),
     )
@@ -1598,7 +1825,7 @@ def order_refresh_listings(
     if known_listings:
         offset %= len(known_listings)
         known_listings = known_listings[offset:] + known_listings[:offset]
-    return new_listings + known_listings
+    return prioritized + new_listings + known_listings
 
 
 def refresh_details(
@@ -1608,6 +1835,8 @@ def refresh_details(
     write: bool = False,
     best_effort: bool = False,
     warnings: list[str] | None = None,
+    priority_ids: list[str] | None = None,
+    retryable_failures: set[str] | None = None,
 ) -> list[dict]:
     """Fetch publishers and append immutable central snapshots.
 
@@ -1624,14 +1853,49 @@ def refresh_details(
     pending_releases: dict[tuple[str, str], dict] = {}
     remaining_candidates = MAXIMUM_NEW_RELEASE_COUNT
     remaining_candidate_bytes = MAXIMUM_NEW_RELEASE_BYTES
+    catalog_ids = {plugin["id"].casefold() for plugin in catalog}
+    has_active_publishers = any(
+        listing["id"].casefold() in catalog_ids for listing in listings
+    )
+    has_discovery_publishers = any(
+        listing["id"].casefold() not in catalog_ids for listing in listings
+    )
+    reserve_for_active = (
+        has_active_publishers
+        and has_discovery_publishers
+        and not os.environ.get("NYA_REFRESH_TARGET")
+    )
+    if reserve_for_active:
+        active_candidate_reserve = max(1, MAXIMUM_NEW_RELEASE_COUNT // 2)
+        active_byte_reserve = max(1, MAXIMUM_NEW_RELEASE_BYTES // 2)
+        discovery_candidates = max(
+            0, MAXIMUM_NEW_RELEASE_COUNT - active_candidate_reserve
+        )
+        discovery_candidate_bytes = max(
+            0, MAXIMUM_NEW_RELEASE_BYTES - active_byte_reserve
+        )
+    else:
+        discovery_candidates = remaining_candidates
+        discovery_candidate_bytes = remaining_candidate_bytes
     processed_publishers = 0
-    for listing in order_refresh_listings(listings, catalog):
+    for listing in order_refresh_listings(listings, catalog, priority_ids):
         if (
             remaining_candidates <= 0
             or remaining_candidate_bytes <= 0
             or processed_publishers >= MAXIMUM_REFRESH_PUBLISHERS
         ):
             break
+        listing_id = listing["id"].casefold()
+        is_discovery = listing_id not in catalog_ids
+        candidate_budget = remaining_candidates
+        candidate_byte_budget = remaining_candidate_bytes
+        if reserve_for_active and is_discovery:
+            candidate_budget = min(candidate_budget, discovery_candidates)
+            candidate_byte_budget = min(
+                candidate_byte_budget, discovery_candidate_bytes
+            )
+            if candidate_budget <= 0 or candidate_byte_budget <= 0:
+                continue
         # Every attempted publisher consumes the network-attempt budget,
         # including unreachable, invalid, or already-current manifests.
         processed_publishers += 1
@@ -1639,9 +1903,39 @@ def refresh_details(
             plugin, releases = merge_publisher_snapshot(
                 by_id,
                 listing,
-                maximum_candidates=remaining_candidates,
-                maximum_candidate_bytes=remaining_candidate_bytes,
+                maximum_candidates=candidate_budget,
+                maximum_candidate_bytes=candidate_byte_budget,
             )
+        except PublisherCandidateFailure as exc:
+            if (
+                exc.attempted_count > candidate_budget
+                or exc.attempted_bytes > candidate_byte_budget
+            ):
+                raise ValidationFailure("发布候选失败批次超过本轮剩余全局预算") from exc
+            remaining_candidates -= exc.attempted_count
+            remaining_candidate_bytes -= exc.attempted_bytes
+            if reserve_for_active and is_discovery:
+                discovery_candidates -= exc.attempted_count
+                discovery_candidate_bytes -= exc.attempted_bytes
+            if exc.retryable and retryable_failures is not None:
+                retryable_failures.add(listing_id)
+            if not best_effort:
+                raise
+            message = f"{listing.get('id', '<unknown>')}：{exc}；保留原中心历史"
+            if warnings is not None:
+                warnings.append(message)
+            emit_refresh_warning(message)
+            continue
+        except AvailabilityFailure as exc:
+            if retryable_failures is not None:
+                retryable_failures.add(listing_id)
+            if not best_effort:
+                raise
+            message = f"{listing.get('id', '<unknown>')}：{exc}；保留原中心历史"
+            if warnings is not None:
+                warnings.append(message)
+            emit_refresh_warning(message)
+            continue
         except ValidationFailure as exc:
             if not best_effort:
                 raise
@@ -1654,14 +1948,17 @@ def refresh_details(
             used_candidates = len(releases)
             used_bytes = sum(release["download"]["size"] for release in releases)
             if (
-                used_candidates > remaining_candidates
-                or used_bytes > remaining_candidate_bytes
+                used_candidates > candidate_budget
+                or used_bytes > candidate_byte_budget
             ):
                 raise ValidationFailure(
                     f"{plugin['id']}: 发布候选超过本轮剩余全局预算"
                 )
             remaining_candidates -= used_candidates
             remaining_candidate_bytes -= used_bytes
+            if reserve_for_active and is_discovery:
+                discovery_candidates -= used_candidates
+                discovery_candidate_bytes -= used_bytes
             pending_plugins[plugin["id"]] = plugin
             for release in releases:
                 pending_releases[(plugin["id"], release["version"])] = release
@@ -1766,8 +2063,13 @@ def download_release_asset(plugin: dict, release: dict) -> bytes:
                 chunks.append(chunk)
     except ValidationFailure:
         raise
+    except urllib.error.HTTPError as exc:
+        failure = AvailabilityFailure if is_retryable_http_error(exc) else ValidationFailure
+        raise failure(
+            f"{plugin['id']} {release['version']}: 无法下载 Release 资产：HTTP {exc.code}"
+        ) from exc
     except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
-        raise ValidationFailure(
+        raise AvailabilityFailure(
             f"{plugin['id']} {release['version']}: 无法下载 Release 资产：{exc}"
         ) from exc
     if received != expected_size:

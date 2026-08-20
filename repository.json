@@ -5,6 +5,7 @@
   "sourceUrl": "https://github.com/TouristH/NyaLauncher-Plugins",
   "launcherUrl": "https://github.com/redstore-noob/NyaLauncher",
   "indexPath": "public/v1/index.json",
+  "registryBotLogin": "nyalauncher-registry-bot[bot]",
   "trustedReviewers": [
     "TouristH"
   ]

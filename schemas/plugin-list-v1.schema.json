@@ -2,16 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/plugin-list-v1.schema.json",
   "title": "NyaLauncher active publisher repository list v1",
-  "description": "The deliberately small, human-reviewed list of active plugin publisher repositories.",
+  "description": "The bounded list of monitored plugin publishers, bound to immutable GitHub numeric identities.",
   "type": "array",
   "maxItems": 2048,
   "items": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["id", "repositoryUrl"],
+    "required": ["id", "repositoryUrl", "repositoryId", "ownerId"],
     "properties": {
       "id": { "$ref": "#/$defs/pluginId" },
-      "repositoryUrl": { "$ref": "#/$defs/githubRepository" }
+      "repositoryUrl": { "$ref": "#/$defs/githubRepository" },
+      "repositoryId": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 9223372036854775807
+      },
+      "ownerId": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 9223372036854775807
+      }
     }
   },
   "$defs": {

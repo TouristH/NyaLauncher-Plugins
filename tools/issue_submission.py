@@ -24,6 +24,7 @@ APPROVAL_COMMENT_MARKER = "<!-- nyalauncher-plugin-registry:approved -->"
 APPROVAL_COMMENT_HEADING = "## 🎉 已批准并写入插件中心"
 REJECTION_COMMENT_MARKER = "<!-- nyalauncher-plugin-registry:rejected -->"
 REJECTION_COMMENT_HEADING = "## 🚫 维护者已拒绝"
+REVIEW_PROMPT_HEADING = "## 🔎 等待管理员人工审核"
 
 
 class SubmissionFailure(Exception):
@@ -406,27 +407,10 @@ def apply_request(event: dict, actor: str) -> str:
         if review_path.exists():
             review_path.unlink()
 
-    release_directory = ROOT / "plugins" / plugin_id / "releases"
-    all_yanked = True
-    for release_path in release_directory.glob("*.json"):
-        try:
-            release = json.loads(release_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise SubmissionFailure(f"无法确认插件撤回状态：{release_path.name}") from exc
-        if not isinstance(release, dict) or release.get("yanked") is not True:
-            all_yanked = False
-            break
-    if all_yanked:
-        listings_path = ROOT / "plugins.json"
-        try:
-            listings = json.loads(listings_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise SubmissionFailure("无法读取 active 插件列表") from exc
-        if not isinstance(listings, list) or any(not isinstance(item, dict) for item in listings):
-            raise SubmissionFailure("plugins.json active 插件列表无效")
-        remaining = [item for item in listings if item.get("id") != plugin_id]
-        if len(remaining) != len(listings):
-            write_json(listings_path, remaining)
+    # Keep the publisher pointer even when every current release is yanked.
+    # Besides allowing a later fixed version to be discovered automatically,
+    # the pointer preserves GitHub's immutable numeric repository identity and
+    # prevents a renamed owner/repository path from being silently reclaimed.
     return validate_yank(event)
 
 
@@ -622,9 +606,9 @@ def initialize_issue(event: dict) -> None:
 
     title = str(event["issue"].get("title") or "")
     if title.startswith("[Plugin]"):
-        selected = ["plugin-submission", "pending-validation"]
+        selected = ["plugin-submission", "queued-for-intake"]
     elif title.startswith("[Yank]"):
-        selected = ["plugin-yank", "pending-validation"]
+        selected = ["plugin-yank", "pending-review"]
     elif title.startswith("[Review]"):
         selected = ["review-request"]
     else:
@@ -633,12 +617,65 @@ def initialize_issue(event: dict) -> None:
         "plugin-submission": "5319e7",
         "plugin-yank": "d73a4a",
         "review-request": "0e8a16",
-        "pending-validation": "d4c5f9",
+        "queued-for-intake": "d4c5f9",
+        "pending-review": "fbca04",
     }
     for name, color in definitions.items():
         ensure_label(event, name, color)
     _, number, _ = github_context(event)
     github_api(event, "POST", f"issues/{number}/labels", {"labels": selected})
+    if title.startswith("[Review]"):
+        publish_review_prompt(event)
+
+
+def canonical_review_target(event: dict) -> tuple[str, str, str]:
+    """Resolve an Issue's display target; apply-review never trusts this body."""
+
+    sections = parse_sections(str(event["issue"].get("body") or ""))
+    plugin_id = field(sections, "插件 ID / Plugin ID")
+    version = field(sections, "版本 / Version")
+    if len(plugin_id) > 128 or validator.PLUGIN_ID.fullmatch(plugin_id) is None:
+        raise SubmissionFailure("审核请求中的插件 ID 无效")
+    if len(version) > 64 or validator.match_semver(version) is None:
+        raise SubmissionFailure("审核请求中的版本必须是严格 SemVer")
+    plugin = next(
+        (item for item in validator.load_catalog() if item["id"] == plugin_id),
+        None,
+    )
+    if plugin is None:
+        raise SubmissionFailure(f"插件尚未收录：{plugin_id}")
+    release = next(
+        (item for item in plugin["releases"] if item["version"] == version),
+        None,
+    )
+    if release is None:
+        raise SubmissionFailure(f"版本尚未收录：{plugin_id} {version}")
+    if release["yanked"]:
+        raise SubmissionFailure("已撤回版本不能申请绿色审核标志")
+    return plugin_id, version, release["download"]["sha256"]
+
+
+def publish_review_prompt(event: dict) -> None:
+    _, number, _ = github_context(event)
+    if has_heading_comment(event, number, REVIEW_PROMPT_HEADING):
+        return
+    try:
+        plugin_id, version, sha256 = canonical_review_target(event)
+        body = (
+            f"{REVIEW_PROMPT_HEADING}\n\n"
+            "机器人已从中心不可变历史解析审核目标。管理员完成源码、依赖、能力与行为检查后，"
+            "复制下面的完整命令：\n\n"
+            f"```text\n/verify {plugin_id}@{version} sha256:{sha256}\n```\n\n"
+            "撤销已有审核标志时使用：\n\n"
+            f"```text\n/revoke-review {plugin_id}@{version} sha256:{sha256} 撤销原因\n```\n\n"
+            "最终操作只信任管理员评论中的完整 ID、版本和 SHA-256，不信任可编辑的 Issue 正文。"
+        )
+    except (SubmissionFailure, validator.ValidationFailure) as exc:
+        body = (
+            "## ❌ 暂时无法生成审核命令\n\n"
+            f"{exc}\n\n请确认该版本已经由收录机器人合并到 `main`，修正 Issue 后重新打开。"
+        )
+    github_api(event, "POST", f"issues/{number}/comments", {"body": body})
 
 
 def has_heading_comment(event: dict, number: int, heading: str) -> bool:
@@ -697,7 +734,7 @@ def publish_completion(event: dict, summary: str) -> None:
     github_api(event, "PATCH", f"issues/{number}", {"state": "closed"})
     # Remove transient labels last.  Until the durable comment and close have
     # succeeded, the Issue remains discoverable for a safe workflow retry.
-    for name in ("pending-validation", "validated", "validation-failed"):
+    for name in ("pending-review", "pending-validation", "validated", "validation-failed"):
         remove_label(event, name)
 
 
@@ -727,7 +764,7 @@ def reject_request(event: dict, actor: str) -> None:
             },
         )
     github_api(event, "PATCH", f"issues/{number}", {"state": "closed"})
-    for name in ("pending-validation", "validated", "validation-failed"):
+    for name in ("pending-review", "pending-validation", "validated", "validation-failed"):
         remove_label(event, name)
 
 

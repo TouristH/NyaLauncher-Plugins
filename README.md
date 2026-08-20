@@ -14,12 +14,13 @@ NyaLauncher 的独立社区插件索引。插件代码和安装包仍由作者�
 
 ## 工作方式
 
-本仓库结合了 Issue 收录与固定 Release 包两种机制：
+本仓库结合了 GitHub Topic 自动发现、Issue 兜底与固定 Release 包三种机制：
 
-1. `plugins.json` 只登记插件 ID 和作者仓库地址。
+1. `plugins.json` 登记插件 ID、作者仓库地址及 GitHub 不可复用的仓库/所有者数字 ID。
 2. 插件作者在自己仓库根目录维护 `_manifest.json`，以升序 `releases[]` 保留完整发行历史。
 3. 每个发行版必须是不可变的 GitHub Release ZIP，并声明精确 URL、字节数和 SHA-256。
-4. 自动同步会下载 ZIP，检查包根 `plugin.json`、入口 DLL、兼容性、能力声明和安全路径。
+4. 收录机器人搜索 `nyalauncher-plugin` Topic，并自动下载 ZIP，检查包根 `plugin.json`、
+   入口 DLL、兼容性、能力声明和安全路径。
 5. 验证通过的新版本只会追加到该插件自己的历史目录，不会覆盖旧版本。
 6. `public/v1/index.json` 由历史目录和管理员审核记录确定性生成，供启动器下载。
 
@@ -36,13 +37,18 @@ plugins/<plugin-id>/
 
 ## 提交插件
 
-推荐使用 [Add Plugin Issue](../../issues/new?template=add-plugin.yml)，无需 Fork 中心仓库：
+正常发布不需要 Fork 中心仓库，也不需要等待管理员批准：
 
 1. 在作者仓库创建固定 GitHub Release，上传 ZIP。
 2. 在作者仓库根目录添加 `_manifest.json`（示例见
    [`templates/_manifest.json`](templates/_manifest.json)）。
-3. 创建 Add Plugin Issue，只填写插件 ID 和公开仓库地址。
-4. 维护者输入 `/validate` 触发固定 ZIP 技术验证，通过后使用 `/approve` 收录。
+3. 插件 ID 使用 `io.github.<仓库所有者小写>.<名称>`，并给仓库添加
+   `nyalauncher-plugin` Topic。
+4. 机器人自动发现、严格验证并通过机器人 PR 收录；收录时默认没有绿色审核标志。
+
+GitHub Topic 索引可能短暂延迟。需要立即进入队列时可创建
+[Plugin Queue Issue](../../issues/new?template=add-plugin.yml)；它仍由机器人自动处理，不需要
+管理员输入 `/validate` 或 `/approve`。
 
 首次收录后，作者发布新版本只需创建新的 Release，并把新项追加到 `_manifest.json` 的完整
 `releases[]`。同步任务会以有界批次将缺失版本追加到 `plugins/<id>/releases/`，不会因两次采样间
@@ -57,12 +63,37 @@ plugins/<plugin-id>/
 - **管理员已审核（verified）**：可信审核者审查了精确的插件 ID、版本和 ZIP SHA-256，启动器显示绿色标志。
 - **未经审核**：启动器显示醒目警告，并在下载前要求用户再次确认风险。
 
-审核记录位于 `reviews/<插件 ID>/<版本>.json`。如果同版本包的 SHA-256 发生变化，审核不会迁移，
-而是使验证失败。管理员可以删除审核记录撤销绿色标志，并将风险版本标记为 `yanked`。
+审核记录位于 `reviews/<插件 ID>/<版本>.json`。管理员完成代码与行为检查后，在 Review Issue
+中执行机器人给出的完整命令：
+
+```text
+/verify io.github.example.toolbox@1.2.0 sha256:<中心记录的 64 位哈希>
+```
+
+命令中的 ID、版本和 SHA-256 会再次与中心历史核对，固定 ZIP 也会重新下载验证。撤销审核使用
+`/revoke-review ...`；它只移除绿色标志，不删除历史。若同版本资产被替换，审核不会迁移，
+启动器与审核机器人都会拒绝不匹配的字节。
+
+## 收录机器人
+
+自动写入由仅安装在本仓库的 GitHub App 完成。工作流在所有不可信清单和 ZIP 验证结束后才申请
+一小时短期安装令牌，创建同仓机器人 PR，并交由 `policy` 与 `validate` 两项检查后自动合并；
+机器人没有绕过 `main` 规则的权限。部署步骤见 [机器人配置文档](docs/REGISTRY_BOT.md)。
+
+启用机器人前，仓库管理员必须完成以下远端配置：
+
+1. 创建 GitHub App，并且只安装到本插件中心仓库；
+2. 配置 `NYA_REGISTRY_APP_CLIENT_ID` 变量和 `NYA_REGISTRY_APP_PRIVATE_KEY` Secret；
+3. 开启仓库 Auto-merge；
+4. 保护 `main`，将 `policy` 与 `validate` 设为必须且要求分支保持最新；
+5. 限制 `registry-bot/**` 只能由该 GitHub App 创建和更新。
+
+不要配置长期个人 PAT，也不要给予机器人直接推送 `main` 的 bypass。缺少任一项时，工作流会
+安全失败，不会退化为跳过验证直接写入。
 
 ## 公开文件
 
-- [`plugins.json`](plugins.json)：已收录作者仓库列表。
+- [`plugins.json`](plugins.json)：受监控作者仓库及其 GitHub numeric identity 列表。
 - [`plugin_details.json`](plugin_details.json)：从完整历史目录生成的展示数据。
 - [`public/v1/index.json`](public/v1/index.json)：NyaLauncher 使用的严格 v1 索引。
 

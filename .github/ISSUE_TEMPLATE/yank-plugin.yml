@@ -1,13 +1,13 @@
 name: Yank Release / 撤回版本
 description: 请求撤回一个或多个已收录版本，同时保留历史记录
 title: "[Yank] "
-labels: ["plugin-yank", "pending-validation"]
+labels: ["plugin-yank", "pending-review"]
 body:
   - type: input
     id: plugin-id
     attributes:
       label: 插件 ID / Plugin ID
-      placeholder: dev.example.toolbox
+      placeholder: io.github.example.toolbox
     validations:
       required: true
   - type: input

@@ -1,4 +1,4 @@
-name: Refresh publisher manifests
+name: Discover and refresh publisher manifests
 
 on:
   schedule:
@@ -7,17 +7,17 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    environment: registry-writer
     concurrency:
       group: registry-write
       queue: max
     steps:
-      - name: Checkout
+      - name: Checkout trusted registry main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
@@ -27,39 +27,312 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - name: Fetch publisher manifests and hard-verify only the bounded new batch
+      - name: Discover new plugins and refresh the bounded active batch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NYA_REFRESH_OFFSET: ${{ github.run_number }}
-        run: python tools/validate.py --refresh --write --best-effort
+        run: >-
+          python tools/registry_bot.py collect
+          --write
+          --results registry-results.json
+      - name: Report Topic warnings in the workflow summary
+        run: |
+          echo "## Registry collection" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '"- accepted: \(.accepted | length)\n- rejected: \(.rejected | length)\n- deferred: \(.deferred | length)\n- reconciled: \(.reconciled | length)\n- warnings: \(.warnings | length)"' \
+            registry-results.json >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.warnings[] | "- ⚠️ " + (@json)' registry-results.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove rejected fallback Issues from the intake queue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh label create validation-failed --repo "$GITHUB_REPOSITORY" \
+            --color d73a4a --description "Automated package validation failed" --force
+          jq -c '.rejected[] | select(.source == "issue" and (.issueNumber | type) == "number")' \
+            registry-results.json | while IFS= read -r ITEM; do
+            ISSUE_NUMBER="$(jq -r .issueNumber <<<"$ITEM")"
+            REASON="$(jq -r .reason <<<"$ITEM")"
+            MARKER_HASH="$(printf '%s' "$REASON" | sha256sum | awk '{print $1}')"
+            MARKER="<!-- nya-registry-bot:rejected:${MARKER_HASH} -->"
+            FOUND="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"${MARKER}\"))) | .id" \
+              | head -n 1)"
+            if [ -z "$FOUND" ]; then
+              BODY_FILE="$(mktemp)"
+              printf '## 自动技术收录失败\n\n%s\n\n修复作者仓库后，请先关闭再重新打开本 Issue 以重新进入有界队列。\n\n%s\n' \
+                "$REASON" "$MARKER" > "$BODY_FILE"
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"
+              rm -f -- "$BODY_FILE"
+            fi
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --add-label validation-failed
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/plugin-submission" \
+              >/dev/null 2>&1 || true
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/queued-for-intake" \
+              >/dev/null 2>&1 || true
+          done
+      - name: Clear stale failure state from reopened or retryable fallback Issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            jq -r '[.accepted[], .deferred[]] | .[] | select(.source == "issue" and (.issueNumber | type) == "number") | .issueNumber' \
+              registry-results.json
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --label plugin-submission --limit 100 --json number --jq '.[].number'
+          } | sort -nu | while IFS= read -r ISSUE_NUMBER; do
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/validation-failed" \
+              >/dev/null 2>&1 || true
+          done
+      - name: Reconcile fallback Issues whose App PR already reached main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh label create listed-unreviewed --repo "$GITHUB_REPOSITORY" \
+            --color fbca04 --description "Technically listed; administrator review pending" --force
+          jq -r '.reconciled[] | .issueNumber' registry-results.json | while IFS= read -r ISSUE_NUMBER; do
+            MARKER="<!-- nya-registry-bot:reconciled:${ISSUE_NUMBER} -->"
+            FOUND="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"${MARKER}\"))) | .id" \
+              | head -n 1)"
+            if [ -z "$FOUND" ]; then
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "机器人已确认先前的收录 PR 到达 main，并修复了 Issue 终态。${MARKER}"
+            fi
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label listed-unreviewed
+            for LABEL in pending-merge plugin-submission queued-for-intake validation-failed; do
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/${LABEL}" \
+                >/dev/null 2>&1 || true
+            done
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" \
+              -f state=closed >/dev/null
+          done
+      - name: Clear stale pending labels from closed review and yank Issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          delete_label_unless_missing() {
+            local issue_number="$1"
+            local label="$2"
+            local delete_error
+            delete_error="$(mktemp)"
+            if ! gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/issues/${issue_number}/labels/${label}" \
+              >/dev/null 2>"$delete_error"; then
+              if ! grep -q "HTTP 404" "$delete_error"; then
+                cat "$delete_error" >&2
+                rm -f "$delete_error"
+                return 1
+              fi
+            fi
+            rm -f "$delete_error"
+          }
+
+          OLDER_PAGE="$((2 + GITHUB_RUN_NUMBER % 32))"
+          for LABEL in review-request pending-review; do
+            for PAGE in 1 "$OLDER_PAGE"; do
+              gh api --method GET "repos/${GITHUB_REPOSITORY}/issues" \
+                -f state=closed -f labels="$LABEL" -f sort=updated \
+                -f direction=desc -f per_page=100 -f page="$PAGE" \
+                --jq '.[].number' | while IFS= read -r ISSUE_NUMBER; do
+                delete_label_unless_missing "$ISSUE_NUMBER" "$LABEL"
+              done
+            done
+          done
+      - name: Build the deterministic registry PR body
+        run: |
+          printf '%s\n\n' \
+            'Automated technical collection of valid, fixed Release ZIP snapshots.' \
+            'New versions remain unreviewed until a trusted administrator adds a hash-bound review record.' \
+            > registry-pr-body.md
+          jq -r '.accepted[] | select(.source == "issue" and (.issueNumber | type) == "number") | "Closes #\(.issueNumber)"' \
+            registry-results.json >> registry-pr-body.md
+      - name: Validate deterministic registry output
+        run: python tools/validate.py --check
       - name: Run regression tests
         run: python -m unittest discover -s tests -v
-      - name: Commit appended versions
-        id: commit
+      - name: Stage only registry data
+        id: changes
         run: |
-          git add -- plugins plugin_details.json public/v1/index.json
+          git add -- plugins.json plugins plugin_details.json public/v1/index.json
+          git diff --cached --check
           if git diff --cached --quiet; then
             echo "No publisher changes"
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -c core.hooksPath=/dev/null commit -m "chore: refresh plugin releases"
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
-      - name: Push refreshed history with the isolated writer identity
-        if: steps.commit.outputs.has_changes == 'true'
+      - name: Finish fallback Issues that were already listed
+        if: steps.changes.outputs.has_changes != 'true'
         env:
-          WRITER_TOKEN: ${{ secrets.NYA_REGISTRY_WRITER_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -z "$WRITER_TOKEN" ]; then
-            echo "::error::NYA_REGISTRY_WRITER_TOKEN is not configured"
-            exit 1
-          fi
-          AUTH_HEADER="$(printf 'x-access-token:%s' "$WRITER_TOKEN" | base64 -w 0)"
+          set -euo pipefail
+          gh label create listed-unreviewed --repo "$GITHUB_REPOSITORY" \
+            --color fbca04 --description "Technically listed; administrator review pending" --force
+          jq -r '.accepted[] | select(.source == "issue" and (.issueNumber | type) == "number") | .issueNumber' \
+            registry-results.json | while IFS= read -r ISSUE_NUMBER; do
+            MARKER="<!-- nya-registry-bot:already-listed:${ISSUE_NUMBER} -->"
+            FOUND="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"${MARKER}\"))) | .id" \
+              | head -n 1)"
+            if [ -z "$FOUND" ]; then
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "该插件已经在中心目录中；本次机器人任务已幂等完成。${MARKER}"
+            fi
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --add-label listed-unreviewed
+            for LABEL in plugin-submission queued-for-intake validation-failed; do
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/${LABEL}" \
+                >/dev/null 2>&1 || true
+            done
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" \
+              -f state=closed >/dev/null
+          done
+      - name: Mint a short-lived registry App token
+        if: steps.changes.outputs.has_changes == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.NYA_REGISTRY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NYA_REGISTRY_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Commit, push the App branch, and open or update its PR
+        if: steps.changes.outputs.has_changes == 'true'
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BRANCH: registry-bot/sync
+        run: |
+          set -euo pipefail
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git -c core.hooksPath=/dev/null commit -m "chore: refresh plugin registry"
+
+          AUTH_HEADER="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
           cleanup_writer_auth() {
             git config --local --unset-all http.https://github.com/.extraheader || true
           }
           trap cleanup_writer_auth EXIT
           git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $AUTH_HEADER"
-          git -c core.hooksPath=/dev/null push origin HEAD:main
+
+          REMOTE_SHA="$(git ls-remote --heads origin "refs/heads/${BRANCH}" | awk '{print $1}')"
+          if [ -n "$REMOTE_SHA" ]; then
+            git -c core.hooksPath=/dev/null push \
+              --force-with-lease="refs/heads/${BRANCH}:${REMOTE_SHA}" \
+              origin "HEAD:refs/heads/${BRANCH}"
+          else
+            git -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${BRANCH}"
+          fi
+
+          PR_DATA="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+            -f state=open -f base=main \
+            -f "head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}" -f per_page=100 | \
+            jq -c --arg repo "$GITHUB_REPOSITORY" --arg bot "${APP_SLUG}[bot]" \
+              '[.[] | select(((.head.repo.full_name // "") | ascii_downcase) == ($repo | ascii_downcase) and ((.user.login // "") | ascii_downcase) == ($bot | ascii_downcase))] | if length == 0 then {} else {number: .[0].number, url: .[0].html_url} end')"
+          PR_NUMBER="$(jq -r '.number // empty' <<<"$PR_DATA")"
+          if [ -z "$PR_NUMBER" ]; then
+            PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "chore: refresh plugin registry" --body-file registry-pr-body.md)"
+            PR_NUMBER="$(gh pr view "$PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
+          else
+            PR_URL="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file registry-pr-body.md
+          fi
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+      - name: Link accepted fallback Issues to the pending App PR
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ steps.publish.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          gh label create pending-merge --repo "$GITHUB_REPOSITORY" \
+            --color 1d76db --description "Validated registry App PR is waiting to merge" --force
+          jq -r '.accepted[] | select(.source == "issue" and (.issueNumber | type) == "number") | .issueNumber' \
+            registry-results.json | while IFS= read -r ISSUE_NUMBER; do
+            MARKER="<!-- nya-registry-bot:pending-pr:${{ steps.publish.outputs.pr_number }} -->"
+            FOUND="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"${MARKER}\"))) | .id" \
+              | head -n 1)"
+            if [ -z "$FOUND" ]; then
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "技术验证已通过，正在由 ${PR_URL} 写入中心。${MARKER}"
+            fi
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label pending-merge
+            for LABEL in queued-for-intake validation-failed; do
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/${LABEL}" \
+                >/dev/null 2>&1 || true
+            done
+          done
+      - name: Enable protected auto-merge and wait for main
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.publish.outputs.pr_number }}
+          BRANCH: registry-bot/sync
+        run: |
+          set -euo pipefail
+          PR_STATE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
+          AUTO_MERGE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$PR_STATE" = "OPEN" ] && [ "$AUTO_MERGE" != "true" ]; then
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --auto --squash --delete-branch
+          fi
+
+          for _ in $(seq 1 180); do
+            PR_DATA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json state,mergeStateStatus --jq '.state + " " + .mergeStateStatus')"
+            case "$PR_DATA" in
+              MERGED\ *)
+                gh api --method DELETE \
+                  "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" >/dev/null 2>&1 || true
+                exit 0
+                ;;
+              CLOSED\ *)
+                echo "::error::Registry App PR #${PR_NUMBER} was closed without merging"
+                exit 1
+                ;;
+              "OPEN BEHIND")
+                gh api --method PUT \
+                  "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/update-branch" >/dev/null
+                ;;
+            esac
+            sleep 10
+          done
+          echo "::error::Timed out waiting for Registry App PR #${PR_NUMBER} to merge"
+          exit 1
+      - name: Mark accepted fallback Issues listed but unreviewed
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh label create listed-unreviewed --repo "$GITHUB_REPOSITORY" \
+            --color fbca04 --description "Technically listed; administrator review pending" --force
+          jq -r '.accepted[] | select(.source == "issue" and (.issueNumber | type) == "number") | .issueNumber' \
+            registry-results.json | while IFS= read -r ISSUE_NUMBER; do
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --add-label listed-unreviewed
+            for LABEL in pending-merge plugin-submission queued-for-intake validation-failed; do
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/${LABEL}" \
+                >/dev/null 2>&1 || true
+            done
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" \
+              -f state=closed >/dev/null
+          done

@@ -1,10 +1,8 @@
-name: Validate plugin issue
+name: Initialize plugin request
 
 on:
   issues:
     types: [opened, reopened]
-  issue_comment:
-    types: [created]
 
 permissions: {}
 
@@ -34,51 +32,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python tools/issue_submission.py initialize --event "$GITHUB_EVENT_PATH"
-
-  authorize:
-    if: >-
-      github.event_name == 'issue_comment' &&
-      (startsWith(github.event.issue.title, '[Plugin]') ||
-       startsWith(github.event.issue.title, '[Yank]')) &&
-      github.event.comment.body == '/validate'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout trusted registry code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-      - name: Authorize trusted reviewer without mutating the Issue
-        run: python tools/issue_submission.py authorize --event "$GITHUB_EVENT_PATH"
-
-  validate:
-    needs: authorize
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      issues: write
-    concurrency:
-      group: issue-validation-${{ github.event.issue.number }}
-      cancel-in-progress: true
-    steps:
-      - name: Checkout trusted registry code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-      - name: Validate Issue and fixed Release ZIP
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python tools/issue_submission.py validate --event "$GITHUB_EVENT_PATH" --publish

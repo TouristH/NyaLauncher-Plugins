@@ -1,7 +1,7 @@
 {
   "$schema": "../../schemas/catalog-plugin-v1.schema.json",
   "schemaVersion": 1,
-  "id": "dev.example.toolbox",
+  "id": "io.github.example.toolbox",
   "name": "Example Toolbox",
   "description": "一句话说明插件提供的功能。",
   "authors": [
