@@ -1,6 +1,9 @@
 * @TouristH
 
 /.github/ @TouristH
+/plugins/ @TouristH
+/plugins.json @TouristH
+/plugin_details.json @TouristH
 /schemas/ @TouristH
 /templates/ @TouristH
 /tests/ @TouristH

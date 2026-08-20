@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -38,13 +39,87 @@ MANIFEST = {
     "optionalCapabilities": [],
 }
 
+PUBLISHER_MANIFEST = {
+    "$schema": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/publisher-manifest-v1.schema.json",
+    "manifest_version": 1,
+    "id": "dev.example.test",
+    "name": "Test",
+    "description": "Fixture",
+    "authors": ["Example"],
+    "license": "MIT",
+    "repository_url": "https://github.com/example/test",
+    "maintainers": ["example"],
+    "categories": ["utilities"],
+    "releases": [
+        {
+            "version": "1.0.0",
+            "channel": "stable",
+            "published_at": "2026-08-20T00:00:00Z",
+            "release_notes_url": "https://github.com/example/test/releases/tag/v1.0.0",
+            "download": {
+                "url": "https://github.com/example/test/releases/download/v1.0.0/dev.example.test-1.0.0.zip",
+                "sha256": "a" * 64,
+                "size": 123,
+            },
+            "api_version": "1.0",
+            "minimum_launcher_version": "0.1.0",
+            "required_capabilities": [],
+            "optional_capabilities": [],
+        },
+    ],
+}
 
-def create_zip(extra_name=None, manifest=None, directory_payload=False):
+
+def publisher_release(
+    version: str,
+    *,
+    sha256: str = "b" * 64,
+    size: int = 456,
+    hour: int = 1,
+) -> dict:
+    return {
+        "version": version,
+        "channel": "stable",
+        "published_at": f"2026-08-20T{hour:02d}:00:00Z",
+        "release_notes_url": f"https://github.com/example/test/releases/tag/v{version}",
+        "download": {
+            "url": (
+                "https://github.com/example/test/releases/download/"
+                f"v{version}/dev.example.test-{version}.zip"
+            ),
+            "sha256": sha256,
+            "size": size,
+        },
+        "api_version": "1.0",
+        "minimum_launcher_version": "0.1.0",
+        "required_capabilities": [],
+        "optional_capabilities": [],
+    }
+
+
+def publisher_with(*additional_releases: dict) -> dict:
+    manifest = copy.deepcopy(PUBLISHER_MANIFEST)
+    manifest["releases"].extend(copy.deepcopy(list(additional_releases)))
+    manifest["releases"].sort(key=lambda item: validator.semver_key(item["version"]))
+    return manifest
+
+
+def create_zip(
+    extra_name=None,
+    manifest=None,
+    directory_payload=False,
+    manifest_text: str | None = None,
+    manifest_name: str = "plugin.json",
+):
     memory = io.BytesIO()
     with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "plugin.json",
-            json.dumps(manifest or MANIFEST, ensure_ascii=False).encode("utf-8"),
+            manifest_name,
+            (
+                manifest_text
+                if manifest_text is not None
+                else json.dumps(manifest or MANIFEST, ensure_ascii=False)
+            ).encode("utf-8"),
         )
         archive.writestr("Test.dll", b"MZtest assembly metadata")
         if extra_name is not None:
@@ -89,6 +164,15 @@ class RegistryFixture:
             },
         )
         write_json(
+            root / "plugins.json",
+            [
+                {
+                    "id": self.plugin_id,
+                    "repositoryUrl": "https://github.com/example/test",
+                }
+            ],
+        )
+        write_json(
             self.plugin_path,
             {
                 "schemaVersion": 1,
@@ -108,10 +192,10 @@ class RegistryFixture:
                 "schemaVersion": 1,
                 "version": self.version,
                 "channel": "stable",
-                "publishedAt": "2026-08-13T00:00:00Z",
+                "publishedAt": "2026-08-20T00:00:00Z",
                 "releaseNotesUrl": "https://github.com/example/test/releases/tag/v1.0.0",
                 "download": {
-                    "url": "https://github.com/example/test/releases/download/v1.0.0/test.zip",
+                    "url": "https://github.com/example/test/releases/download/v1.0.0/dev.example.test-1.0.0.zip",
                     "sha256": self.sha256,
                     "size": 123,
                 },
@@ -154,6 +238,20 @@ class RuntimePackageTests(unittest.TestCase):
                 PLUGIN["id"], RELEASE["version"], "folder\\escape.txt", False
             )
 
+    def test_windows_superscript_device_names_are_rejected(self):
+        for name in ("COM¹/payload.dll", "COM².txt", "COM³", "LPT¹/file"):
+            with self.subTest(name=name), self.assertRaises(ValidationFailure):
+                validator.validate_zip_path(
+                    PLUGIN["id"], RELEASE["version"], name, False
+                )
+
+    def test_zip_path_limit_uses_launcher_utf16_length(self):
+        astral_path = "/".join(["😀" * 100] * 3)
+        with self.assertRaises(ValidationFailure):
+            validator.validate_zip_path(
+                PLUGIN["id"], RELEASE["version"], astral_path, False
+            )
+
     def test_directory_entry_with_payload_is_rejected(self):
         with self.assertRaises(ValidationFailure):
             validator.validate_runtime_package(
@@ -182,11 +280,261 @@ class RuntimePackageTests(unittest.TestCase):
                 create_zip(manifest=manifest),
             )
 
+    def test_root_manifest_name_and_referenced_paths_are_case_exact(self):
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest_name="PLUGIN.JSON"),
+            )
+
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["entryAssembly"] = "test.dll"
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest=manifest),
+            )
+
+    def test_runtime_manifest_depth_matches_system_text_json_limit(self):
+        manifest = copy.deepcopy(MANIFEST)
+        nested: object = 0
+        for _ in range(65):
+            nested = {"value": nested}
+        manifest["unknownDeepValue"] = nested
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest=manifest),
+            )
+
+    def test_runtime_field_names_use_ascii_case_insensitive_binding(self):
+        manifest = copy.deepcopy(MANIFEST)
+        entry_assembly = manifest.pop("entryAssembly")
+        manifest["entryAſſembly"] = entry_assembly
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest=manifest),
+            )
+
+    def test_settings_must_be_an_array(self):
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["settings"] = "not-an-array"
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest=manifest),
+            )
+
+    def test_optional_manifest_fields_are_strongly_typed_and_bounded(self):
+        for value in (42, "x" * 2049, "😀" * 1025):
+            with self.subTest(homepage=value):
+                manifest = copy.deepcopy(MANIFEST)
+                manifest["homepage"] = value
+                with self.assertRaises(ValidationFailure):
+                    validator.validate_runtime_package(
+                        PLUGIN,
+                        RELEASE,
+                        create_zip(manifest=manifest),
+                    )
+
+    def test_complete_setting_definition_is_accepted(self):
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["settings"] = [
+            {
+                "key": "profile.name",
+                "title": "Profile name",
+                "description": "Used by the fixture.",
+                "kind": "Choice",
+                "scope": "MinecraftInstance",
+                "defaultValue": "safe",
+                "required": True,
+                "maximumLength": 16,
+                "pattern": "^(?:😀|[a-z])+$",
+                "placeholder": "name",
+                "options": [
+                    {"value": "safe", "label": "Safe", "description": "Default"}
+                ],
+                "fileExtensions": [],
+            }
+        ]
+        validator.validate_runtime_package(
+            PLUGIN,
+            RELEASE,
+            create_zip(manifest=manifest),
+        )
+
+    def test_default_value_raw_json_length_matches_launcher_contract(self):
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["Settings"] = [
+            {
+                "key": "sample",
+                "title": "Sample",
+                "kind": "Text",
+                "DefaultValue": "a" * 6000,
+            }
+        ]
+        manifest_text = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
+        canonical_value = json.dumps("a" * 6000, separators=(",", ":"))
+        escaped_value = '"' + "\\u0061" * 6000 + '"'
+        manifest_text = manifest_text.replace(
+            f'"DefaultValue":{canonical_value}',
+            f'"DefaultValue":{escaped_value}',
+        )
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest_text=manifest_text),
+            )
+
+    def test_pattern_must_match_default_value_with_dotnet_regex(self):
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["settings"] = [
+            {
+                "key": "sample",
+                "title": "Sample",
+                "kind": "Text",
+                "pattern": "^z$",
+                "defaultValue": "abc",
+            }
+        ]
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest=manifest),
+            )
+
+    def test_number_default_uses_original_json_token_as_display_text(self):
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["settings"] = [
+            {
+                "key": "sample",
+                "title": "Sample",
+                "kind": "Number",
+                "maximumLength": 3,
+                "defaultValue": 1.0,
+            }
+        ]
+        manifest_text = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
+        manifest_text = manifest_text.replace('"defaultValue":1.0', '"defaultValue":1.00')
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest_text=manifest_text),
+            )
+
+    def test_invalid_setting_definitions_and_defaults_are_rejected(self):
+        base = {"key": "sample", "title": "Sample"}
+        candidates = (
+            {**base, "kind": 1},
+            {**base, "kind": "ſecret"},
+            {**base, "required": "yes"},
+            {**base, "maximumLength": 0},
+            {**base, "minimum": 2, "maximum": 1},
+            {**base, "kind": "Choice", "options": []},
+            {**base, "kind": "Integer", "defaultValue": "1"},
+            {**base, "kind": "Number", "minimum": 2, "defaultValue": 1},
+            {**base, "kind": "File", "defaultValue": "C:/unsafe.txt"},
+            {**base, "pattern": 42},
+            {**base, "pattern": "["},
+            {**base, "minimum": 10**400},
+            {**base, "kind": "Number", "defaultValue": 10**400},
+        )
+        for setting in candidates:
+            with self.subTest(setting=setting):
+                manifest = copy.deepcopy(MANIFEST)
+                manifest["settings"] = [setting]
+                with self.assertRaises(ValidationFailure):
+                    validator.validate_runtime_package(
+                        PLUGIN,
+                        RELEASE,
+                        create_zip(manifest=manifest),
+                    )
+
+    def test_runtime_capabilities_do_not_use_unicode_casefold_equivalences(self):
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["requiredCapabilities"] = ["ſystem.info.read"]
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(
+                PLUGIN,
+                RELEASE,
+                create_zip(manifest=manifest),
+            )
+
+    def test_package_metadata_must_match_publisher_catalog(self):
+        plugin = {
+            "id": PLUGIN["id"],
+            "name": "Test",
+            "description": "Published description",
+            "authors": ["Example"],
+            "license": "MIT",
+        }
+        manifest = copy.deepcopy(MANIFEST)
+        manifest.update(
+            {
+                "description": "Published description",
+                "license": "MIT",
+            }
+        )
+        for field, changed in (
+            ("name", "Different name"),
+            ("description", "Different description"),
+            ("authors", ["Different author"]),
+            ("license", "Apache-2.0"),
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(manifest)
+                candidate[field] = changed
+                with self.assertRaises(ValidationFailure):
+                    validator.validate_runtime_package(
+                        plugin,
+                        RELEASE,
+                        create_zip(manifest=candidate),
+                    )
+
+    def test_every_zip_entry_is_fully_crc_checked(self):
+        memory = io.BytesIO()
+        assembly = b"MZtest assembly metadata"
+        with zipfile.ZipFile(memory, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr(
+                "plugin.json",
+                json.dumps(MANIFEST, ensure_ascii=False).encode("utf-8"),
+            )
+            archive.writestr("Test.dll", assembly)
+            archive.writestr("unused.dat", b"payload that must be CRC checked")
+        payload = bytearray(memory.getvalue())
+        marker = b"payload that must be CRC checked"
+        offset = payload.index(marker)
+        payload[offset + len(marker) - 1] ^= 0x01
+
+        with self.assertRaises(ValidationFailure):
+            validator.validate_runtime_package(PLUGIN, RELEASE, bytes(payload))
+
 
 class StrictContractTests(unittest.TestCase):
+    def test_oversized_json_integer_becomes_isolatable_validation_failure(self):
+        with self.assertRaises(ValidationFailure):
+            validator.parse_json_object(
+                '{"value":' + "9" * 5000 + "}",
+                "publisher::_manifest.json",
+            )
+
     def test_semver_rejects_numeric_prerelease_leading_zero(self):
         self.assertIsNone(validator.match_semver("1.2.3-01"))
         self.assertIsNotNone(validator.match_semver("1.2.3-0.alpha+build.7"))
+
+    def test_semver_numbers_must_fit_launcher_int32_contract(self):
+        self.assertIsNotNone(validator.match_semver("2147483647.0.0-2147483647"))
+        self.assertIsNone(validator.match_semver("2147483648.0.0"))
+        self.assertIsNone(validator.match_semver("1.0.0-2147483648"))
 
     def test_utc_timestamp_is_exact_and_calendar_valid(self):
         path = validator.ROOT / "repository.json"
@@ -204,6 +552,10 @@ class StrictContractTests(unittest.TestCase):
             "https://example.com:444/file",
             "https://user@example.com/file",
             "https://example.com:not-a-port/file",
+            "https://exa mple.com/file",
+            "https://example.com/a b",
+            "https://example.com/%zz",
+            "https://xn--/file",
         ):
             with self.subTest(value=value), self.assertRaises(ValidationFailure):
                 validator.require_https(path, "url", value)
@@ -212,11 +564,669 @@ class StrictContractTests(unittest.TestCase):
             "https://example.com:443/file",
         )
 
+    def test_api_version_uses_ascii_digits_like_launcher(self):
+        self.assertIsNotNone(validator.API_VERSION.fullmatch("1.0"))
+        self.assertIsNone(validator.API_VERSION.fullmatch("1.١"))
+
     def test_index_size_is_bounded_in_utf8_bytes(self):
         with patch.object(validator, "MAXIMUM_INDEX_BYTES", 16):
             with self.assertRaises(ValidationFailure):
                 validator.render({"text": "猫" * 16})
 
+    def test_launcher_facing_text_limits_use_utf16_code_units(self):
+        source = validator.ROOT / "repository.json"
+        with self.assertRaises(ValidationFailure):
+            validator.require_text(source, "name", "😀" * 129, 256)
+        with self.assertRaises(ValidationFailure):
+            validator.require_list_of_text(
+                source,
+                "authors",
+                ["😀" * 129],
+                64,
+                item_maximum=256,
+            )
+
+    def test_repository_source_url_must_match_launcher_github_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configuration = {
+                "schemaVersion": 1,
+                "name": "Test registry",
+                "sourceUrl": "https://gitlab.com/example/registry",
+                "launcherUrl": "https://github.com/redstore-noob/NyaLauncher",
+                "indexPath": "public/v1/index.json",
+                "trustedReviewers": ["TouristH"],
+            }
+            write_json(root / "repository.json", configuration)
+            with patch.object(validator, "ROOT", root), self.assertRaises(ValidationFailure):
+                validator.load_repository_configuration()
+
+
+class PublisherManifestTests(unittest.TestCase):
+    listing = {
+        "id": "dev.example.test",
+        "repositoryUrl": "https://github.com/example/test",
+    }
+
+    def test_snake_case_manifest_maps_to_launcher_catalog_contract(self):
+        manifest = publisher_with(publisher_release("1.1.0"))
+        plugin, releases = validator.validate_publisher_manifest_releases(
+            manifest, self.listing
+        )
+        compatibility_plugin, latest = validator.validate_publisher_manifest(
+            manifest, self.listing
+        )
+
+        self.assertEqual(plugin["id"], self.listing["id"])
+        self.assertEqual(plugin["repositoryUrl"], self.listing["repositoryUrl"])
+        self.assertEqual([release["version"] for release in releases], ["1.0.0", "1.1.0"])
+        self.assertEqual(compatibility_plugin, plugin)
+        self.assertEqual(latest["version"], "1.1.0")
+        self.assertEqual(latest["compatibility"]["manifestVersion"], 1)
+        self.assertEqual(latest["compatibility"]["apiVersion"], "1.0")
+        self.assertFalse(latest["yanked"])
+        self.assertNotIn("review", latest)
+
+    def test_complete_releases_must_be_strictly_semver_ascending(self):
+        manifest = publisher_with(publisher_release("1.1.0"))
+        manifest["releases"].reverse()
+        with self.assertRaises(ValidationFailure):
+            validator.validate_publisher_manifest_releases(manifest, self.listing)
+
+    def test_complete_history_has_a_total_declared_byte_budget(self):
+        manifest = publisher_with(publisher_release("1.1.0", size=100))
+        with patch.object(validator, "MAXIMUM_PUBLISHER_HISTORY_BYTES", 200):
+            with self.assertRaises(ValidationFailure):
+                validator.validate_publisher_manifest_releases(manifest, self.listing)
+
+    def test_non_release_zip_is_rejected(self):
+        for url in (
+            "https://github.com/example/test/archive/refs/heads/main.zip",
+            "https://github.com/example/test/releases/download/v1.0.0/plugin.zip?",
+            "https://github.com/example/test/releases/download/v1.0.0/plugin.zip#",
+        ):
+            with self.subTest(url=url):
+                manifest = copy.deepcopy(PUBLISHER_MANIFEST)
+                manifest["releases"][0]["download"]["url"] = url
+                with self.assertRaises(ValidationFailure):
+                    validator.validate_publisher_manifest(manifest, self.listing)
+
+    def test_release_zip_must_belong_to_declared_repository(self):
+        manifest = copy.deepcopy(PUBLISHER_MANIFEST)
+        manifest["releases"][0]["download"]["url"] = (
+            "https://github.com/attacker/other/releases/download/v1.0.0/plugin.zip"
+        )
+        with self.assertRaises(ValidationFailure):
+            validator.validate_publisher_manifest(manifest, self.listing)
+
+    def test_release_notes_must_be_a_tag_in_the_declared_repository(self):
+        for url in (
+            "https://example.com/example/test/releases/tag/v1.0.0",
+            "https://github.com/attacker/test/releases/tag/v1.0.0",
+            "https://github.com/example/test/releases/tag/",
+            "https://github.com/example/test/releases/tag/v1.0.0?download=1",
+            "https://github.com/example/test/releases/tag/v1.0.0?",
+            "https://github.com/example/test/releases/tag/v1.0.0#notes",
+            "https://github.com/example/test/releases/tag/v1.0.0#",
+            "https://github.com/example/test/releases/tag/foo/../bar",
+            "https://github.com/example/test/releases/tag/foo%5Cbar",
+        ):
+            with self.subTest(url=url):
+                manifest = copy.deepcopy(PUBLISHER_MANIFEST)
+                manifest["releases"][0]["release_notes_url"] = url
+                with self.assertRaises(ValidationFailure):
+                    validator.validate_publisher_manifest(manifest, self.listing)
+
+    def test_release_zip_repository_path_case_must_match_launcher_contract(self):
+        listing = {
+            "id": "dev.example.test",
+            "repositoryUrl": "https://github.com/Example/Test",
+        }
+        manifest = copy.deepcopy(PUBLISHER_MANIFEST)
+        manifest["repository_url"] = "https://github.com/Example/Test"
+        manifest["releases"][0]["release_notes_url"] = (
+            "https://github.com/Example/Test/releases/tag/v1.0.0"
+        )
+        manifest["releases"][0]["download"]["url"] = (
+            "https://github.com/example/test/releases/download/v1.0.0/"
+            "dev.example.test-1.0.0.zip"
+        )
+        with self.assertRaises(ValidationFailure):
+            validator.validate_publisher_manifest(manifest, listing)
+
+    def test_manifest_id_and_repository_must_match_active_listing(self):
+        manifest = copy.deepcopy(PUBLISHER_MANIFEST)
+        manifest["id"] = "dev.example.other"
+        with self.assertRaises(ValidationFailure):
+            validator.validate_publisher_manifest(manifest, self.listing)
+
+
+class PublisherRefreshTests(unittest.TestCase):
+    def refresh(
+        self, fixture: RegistryFixture, publisher: dict, *, write: bool = False
+    ) -> list[dict]:
+        with (
+            patch.object(validator, "ROOT", fixture.root),
+            patch.object(
+                validator,
+                "fetch_publisher_manifest",
+                return_value=copy.deepcopy(publisher),
+            ),
+            patch.object(validator, "verify_new_release_candidate"),
+        ):
+            listings = validator.load_plugin_list()
+            details = validator.build_details()
+            return validator.refresh_details(listings, details, write=write)
+
+    def test_same_version_snapshot_is_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            changed = copy.deepcopy(PUBLISHER_MANIFEST)
+            changed["releases"][0]["download"]["sha256"] = "b" * 64
+
+            with self.assertRaises(ValidationFailure):
+                self.refresh(fixture, changed)
+
+            source = json.loads(fixture.release_path.read_text(encoding="utf-8"))
+            self.assertEqual(source["download"]["sha256"], fixture.sha256)
+
+    def test_known_immutable_history_is_not_downloaded_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            listing = {
+                "id": fixture.plugin_id,
+                "repositoryUrl": "https://github.com/example/test",
+            }
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                patch.object(
+                    validator,
+                    "fetch_publisher_manifest",
+                    return_value=copy.deepcopy(PUBLISHER_MANIFEST),
+                ),
+                patch.object(validator, "verify_new_release_candidate") as verify,
+            ):
+                by_id = {
+                    plugin["id"]: plugin for plugin in validator.load_catalog()
+                }
+                merged = validator.merge_publisher_snapshot(by_id, listing)
+
+            self.assertEqual(merged, (None, []))
+            verify.assert_not_called()
+
+    def test_new_candidate_is_verified_before_any_history_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            newer = publisher_with(publisher_release("1.1.0"))
+            target = (
+                fixture.root
+                / "plugins"
+                / fixture.plugin_id
+                / "releases"
+                / "1.1.0.json"
+            )
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                patch.object(
+                    validator,
+                    "fetch_publisher_manifest",
+                    return_value=copy.deepcopy(newer),
+                ),
+                patch.object(
+                    validator,
+                    "verify_new_release_candidate",
+                    side_effect=ValidationFailure("bad package"),
+                ),
+                self.assertRaises(ValidationFailure),
+            ):
+                validator.refresh_details(
+                    validator.load_plugin_list(),
+                    validator.build_details(),
+                    write=True,
+                )
+            self.assertFalse(target.exists())
+            plugin_source = json.loads(fixture.plugin_path.read_text(encoding="utf-8"))
+            self.assertEqual(plugin_source["name"], "Test")
+
+    def test_all_candidates_are_verified_before_a_multi_version_batch_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            publisher = publisher_with(
+                publisher_release("1.1.0"),
+                publisher_release("1.2.0", sha256="c" * 64, hour=2),
+            )
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                patch.object(
+                    validator,
+                    "fetch_publisher_manifest",
+                    return_value=copy.deepcopy(publisher),
+                ),
+                patch.object(
+                    validator,
+                    "verify_new_release_candidate",
+                    side_effect=[None, ValidationFailure("second package failed")],
+                ) as verify,
+                self.assertRaises(ValidationFailure),
+            ):
+                validator.refresh_details(
+                    validator.load_plugin_list(),
+                    validator.build_details(),
+                    write=True,
+                )
+            self.assertEqual(verify.call_count, 2)
+            for version in ("1.1.0", "1.2.0"):
+                self.assertFalse(
+                    (
+                        fixture.root
+                        / "plugins"
+                        / fixture.plugin_id
+                        / "releases"
+                        / f"{version}.json"
+                    ).exists()
+                )
+
+    def test_best_effort_refresh_isolates_one_publisher_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            listings = [
+                {"id": "dev.example.offline", "repositoryUrl": "https://github.com/example/offline"},
+                {"id": fixture.plugin_id, "repositoryUrl": "https://github.com/example/test"},
+            ]
+            warnings = []
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                patch.object(
+                    validator,
+                    "merge_publisher_snapshot",
+                    side_effect=[ValidationFailure("offline"), (None, [])],
+                ) as merge,
+                patch.object(validator, "emit_refresh_warning") as emit,
+            ):
+                details = validator.refresh_details(
+                    listings,
+                    validator.build_details(),
+                    best_effort=True,
+                    warnings=warnings,
+                )
+            self.assertEqual(merge.call_count, 2)
+            self.assertEqual(details[0]["id"], fixture.plugin_id)
+            self.assertEqual(len(warnings), 1)
+            emit.assert_called_once()
+
+    def test_global_refresh_budget_is_shared_across_publishers(self):
+        catalog = [
+            {"id": f"dev.example.{suffix}", "releases": []}
+            for suffix in ("a", "b", "c")
+        ]
+        listings = [
+            {
+                "id": plugin["id"],
+                "repositoryUrl": f"https://github.com/example/{plugin['id'][-1]}",
+            }
+            for plugin in catalog
+        ]
+        calls = []
+
+        def merge(by_id, listing, **budget):
+            calls.append((listing["id"], budget))
+            if listing["id"].endswith(".a"):
+                releases = [
+                    {"version": "1.0.0", "download": {"size": 100}},
+                    {"version": "1.1.0", "download": {"size": 100}},
+                ]
+            else:
+                releases = [
+                    {"version": "1.0.0", "download": {"size": 50}}
+                ]
+            return {"id": listing["id"]}, releases
+
+        with (
+            patch.object(validator, "load_catalog", return_value=catalog),
+            patch.object(validator, "merge_publisher_snapshot", side_effect=merge),
+            patch.object(validator, "MAXIMUM_NEW_RELEASE_COUNT", 3),
+            patch.object(validator, "MAXIMUM_NEW_RELEASE_BYTES", 250),
+            patch.dict(
+                validator.os.environ,
+                {"NYA_REFRESH_OFFSET": "0", "NYA_REFRESH_TARGET": ""},
+            ),
+        ):
+            validator.refresh_details(listings, [])
+
+        self.assertEqual([call[0] for call in calls], ["dev.example.a", "dev.example.b"])
+        self.assertEqual(calls[0][1]["maximum_candidates"], 3)
+        self.assertEqual(calls[0][1]["maximum_candidate_bytes"], 250)
+        self.assertEqual(calls[1][1]["maximum_candidates"], 1)
+        self.assertEqual(calls[1][1]["maximum_candidate_bytes"], 50)
+
+    def test_invalid_best_effort_publisher_does_not_consume_global_budget(self):
+        catalog = [
+            {"id": f"dev.example.{suffix}", "releases": []}
+            for suffix in ("a", "b")
+        ]
+        listings = [
+            {
+                "id": plugin["id"],
+                "repositoryUrl": f"https://github.com/example/{plugin['id'][-1]}",
+            }
+            for plugin in catalog
+        ]
+        budgets = []
+
+        def merge(by_id, listing, **budget):
+            budgets.append(budget)
+            if listing["id"].endswith(".a"):
+                raise ValidationFailure("invalid publisher")
+            return None, []
+
+        with (
+            patch.object(validator, "load_catalog", return_value=catalog),
+            patch.object(validator, "merge_publisher_snapshot", side_effect=merge),
+            patch.object(validator, "emit_refresh_warning"),
+            patch.dict(
+                validator.os.environ,
+                {"NYA_REFRESH_OFFSET": "0", "NYA_REFRESH_TARGET": ""},
+            ),
+        ):
+            validator.refresh_details(listings, [], best_effort=True)
+
+        self.assertEqual(len(budgets), 2)
+        self.assertEqual(budgets[0], budgets[1])
+
+    def test_refresh_order_rotates_known_publishers_after_new_active_plugins(self):
+        listings = [
+            {"id": "dev.example.a"},
+            {"id": "dev.example.new"},
+            {"id": "dev.example.b"},
+        ]
+        catalog = [
+            {"id": "dev.example.a"},
+            {"id": "dev.example.b"},
+        ]
+        with patch.dict(
+            validator.os.environ,
+            {"NYA_REFRESH_OFFSET": "1", "NYA_REFRESH_TARGET": ""},
+        ):
+            ordered = validator.order_refresh_listings(listings, catalog)
+        self.assertEqual(
+            [listing["id"] for listing in ordered],
+            ["dev.example.new", "dev.example.b", "dev.example.a"],
+        )
+
+    def test_refresh_target_is_first_even_when_it_is_known(self):
+        listings = [
+            {"id": "dev.example.a"},
+            {"id": "dev.example.new"},
+            {"id": "dev.example.b"},
+        ]
+        catalog = [
+            {"id": "dev.example.a"},
+            {"id": "dev.example.b"},
+        ]
+        with patch.dict(
+            validator.os.environ,
+            {
+                "NYA_REFRESH_OFFSET": "1",
+                "NYA_REFRESH_TARGET": "dev.example.a",
+            },
+        ):
+            ordered = validator.order_refresh_listings(listings, catalog)
+        self.assertEqual(
+            [listing["id"] for listing in ordered],
+            ["dev.example.a"],
+        )
+
+        with patch.dict(
+            validator.os.environ,
+            {"NYA_REFRESH_TARGET": "dev.example.missing"},
+        ), self.assertRaises(ValidationFailure):
+            validator.order_refresh_listings(listings, catalog)
+
+    def test_refresh_stops_after_global_publisher_attempt_budget(self):
+        catalog = [
+            {"id": f"dev.example.p{index}", "releases": []}
+            for index in range(5)
+        ]
+        listings = [
+            {
+                "id": plugin["id"],
+                "repositoryUrl": f"https://github.com/example/p{index}",
+            }
+            for index, plugin in enumerate(catalog)
+        ]
+        attempted = []
+
+        def merge(by_id, listing, **budget):
+            attempted.append(listing["id"])
+            return None, []
+
+        with (
+            patch.object(validator, "load_catalog", return_value=catalog),
+            patch.object(validator, "merge_publisher_snapshot", side_effect=merge),
+            patch.object(validator, "MAXIMUM_REFRESH_PUBLISHERS", 3),
+            patch.dict(
+                validator.os.environ,
+                {"NYA_REFRESH_OFFSET": "0", "NYA_REFRESH_TARGET": ""},
+            ),
+        ):
+            validator.refresh_details(listings, [])
+
+        self.assertEqual(
+            attempted,
+            ["dev.example.p0", "dev.example.p1", "dev.example.p2"],
+        )
+
+    def test_new_version_is_appended_without_losing_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            newer = publisher_with(publisher_release("1.1.0"))
+
+            details = self.refresh(fixture, newer, write=True)
+
+            self.assertTrue(fixture.release_path.is_file())
+            self.assertTrue(
+                (
+                    fixture.root
+                    / "plugins"
+                    / fixture.plugin_id
+                    / "releases"
+                    / "1.1.0.json"
+                ).is_file()
+            )
+            self.assertEqual(
+                [item["version"] for item in details[0]["releases"]],
+                ["1.1.0", "1.0.0"],
+            )
+            with patch.object(validator, "ROOT", fixture.root):
+                index = validator.build_index()
+            self.assertEqual(
+                [item["version"] for item in index["plugins"][0]["releases"]],
+                ["1.1.0", "1.0.0"],
+            )
+
+    def test_missing_version_below_central_maximum_can_be_backfilled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            self.refresh(
+                fixture,
+                publisher_with(
+                    publisher_release("1.2.0", sha256="c" * 64, hour=2)
+                ),
+                write=True,
+            )
+            complete = publisher_with(
+                publisher_release("1.1.0"),
+                publisher_release("1.2.0", sha256="c" * 64, hour=2),
+            )
+
+            details = self.refresh(fixture, complete, write=True)
+
+            self.assertEqual(
+                [release["version"] for release in details[0]["releases"]],
+                ["1.2.0", "1.1.0", "1.0.0"],
+            )
+
+    def test_catch_up_batch_selects_latest_missing_versions_with_size_budget(self):
+        plugin, releases = validator.validate_publisher_manifest_releases(
+            publisher_with(
+                publisher_release("1.1.0", size=300),
+                publisher_release("1.2.0", size=300, sha256="c" * 64, hour=2),
+                publisher_release("1.3.0", size=100, sha256="d" * 64, hour=3),
+            ),
+            PublisherManifestTests.listing,
+        )
+        existing = {
+            **plugin,
+            "releases": [
+                validator.validate_publisher_manifest_releases(
+                    copy.deepcopy(PUBLISHER_MANIFEST),
+                    PublisherManifestTests.listing,
+                )[1][0]
+            ],
+        }
+        with (
+            patch.object(validator, "MAXIMUM_NEW_RELEASE_COUNT", 2),
+            patch.object(validator, "MAXIMUM_NEW_RELEASE_BYTES", 399),
+        ):
+            candidates = validator.plan_publisher_candidates(plugin, releases, existing)
+        self.assertEqual(
+            [release["version"] for release in candidates],
+            ["1.3.0"],
+        )
+
+    def test_more_than_one_batch_converges_without_truncating_publisher_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            complete = publisher_with(
+                publisher_release("1.1.0", hour=1),
+                publisher_release("1.2.0", sha256="c" * 64, hour=2),
+                publisher_release("1.3.0", sha256="d" * 64, hour=3),
+                publisher_release("1.4.0", sha256="e" * 64, hour=4),
+            )
+            with patch.object(validator, "MAXIMUM_NEW_RELEASE_COUNT", 2):
+                first = self.refresh(fixture, complete, write=True)
+                second = self.refresh(fixture, complete, write=True)
+
+            self.assertEqual(
+                [release["version"] for release in first[0]["releases"]],
+                ["1.4.0", "1.3.0", "1.0.0"],
+            )
+            self.assertEqual(
+                [release["version"] for release in second[0]["releases"]],
+                ["1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0"],
+            )
+
+    def test_stable_top_level_metadata_cannot_change_with_a_new_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            changed = publisher_with(publisher_release("1.1.0"))
+            changed["name"] = "Renamed"
+            with self.assertRaises(ValidationFailure):
+                self.refresh(fixture, changed)
+
+    def test_archived_history_cannot_reactivate_from_only_an_older_backfill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            historical = json.loads(fixture.release_path.read_text(encoding="utf-8"))
+            historical["yanked"] = True
+            historical["yankReason"] = "Archived."
+            write_json(fixture.release_path, historical)
+            complete = publisher_with(
+                publisher_release("0.5.0", sha256="f" * 64, hour=0)
+            )
+
+            with self.assertRaises(ValidationFailure):
+                self.refresh(fixture, complete, write=True)
+
+            self.assertFalse(
+                (
+                    fixture.root
+                    / "plugins"
+                    / fixture.plugin_id
+                    / "releases"
+                    / "0.5.0.json"
+                ).exists()
+            )
+
+    def test_new_version_preserves_an_administrator_yank_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            release = json.loads(fixture.release_path.read_text(encoding="utf-8"))
+            release["yanked"] = True
+            release["yankReason"] = "Security incident."
+            write_json(fixture.release_path, release)
+            newer = publisher_with(publisher_release("1.1.0"))
+
+            details = self.refresh(fixture, newer)
+
+            self.assertFalse(details[0]["releases"][0]["yanked"])
+            self.assertTrue(details[0]["releases"][1]["yanked"])
+            self.assertEqual(
+                details[0]["releases"][1]["yankReason"], "Security incident."
+            )
+
+    def test_publisher_cannot_roll_current_manifest_back_to_an_older_active_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            newer = publisher_with(publisher_release("1.1.0"))
+            self.refresh(fixture, newer, write=True)
+
+            with self.assertRaises(ValidationFailure):
+                self.refresh(fixture, PUBLISHER_MANIFEST)
+
+    def test_publisher_may_still_point_to_an_administrator_yanked_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            newer = publisher_with(publisher_release("1.1.0"))
+            self.refresh(fixture, newer, write=True)
+            release_path = (
+                fixture.root
+                / "plugins"
+                / fixture.plugin_id
+                / "releases"
+                / "1.1.0.json"
+            )
+            release = json.loads(release_path.read_text(encoding="utf-8"))
+            release["yanked"] = True
+            release["yankReason"] = "Administrator override."
+            write_json(release_path, release)
+
+            details = self.refresh(fixture, newer)
+
+            self.assertTrue(details[0]["releases"][0]["yanked"])
+            self.assertFalse(details[0]["releases"][1]["yanked"])
+
+    def test_publisher_cannot_roll_back_to_a_yanked_version_below_active_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            oldest = json.loads(fixture.release_path.read_text(encoding="utf-8"))
+            oldest["yanked"] = True
+            oldest["yankReason"] = "Old vulnerable release."
+            write_json(fixture.release_path, oldest)
+            newest = copy.deepcopy(oldest)
+            newest["version"] = "4.0.0"
+            newest["publishedAt"] = "2026-08-20T04:00:00Z"
+            newest["releaseNotesUrl"] = (
+                "https://github.com/example/test/releases/tag/v4.0.0"
+            )
+            newest["download"] = {
+                "url": "https://github.com/example/test/releases/download/v4.0.0/dev.example.test-4.0.0.zip",
+                "sha256": "d" * 64,
+                "size": 789,
+            }
+            newest["yanked"] = False
+            newest.pop("yankReason")
+            write_json(
+                fixture.root
+                / "plugins"
+                / fixture.plugin_id
+                / "releases"
+                / "4.0.0.json",
+                newest,
+            )
+
+            with self.assertRaises(ValidationFailure):
+                self.refresh(fixture, PUBLISHER_MANIFEST)
 
 class RegistryGenerationTests(unittest.TestCase):
     def build_fixture(self, fixture: RegistryFixture):
@@ -247,12 +1257,102 @@ class RegistryGenerationTests(unittest.TestCase):
             self.assertNotIn("reviewer", release["review"])
             self.assertNotIn("schemaVersion", release["review"])
 
+    def test_plugin_details_view_is_complete_but_contains_no_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            with patch.object(validator, "ROOT", fixture.root):
+                details = validator.build_details()
+                index = validator.build_index(details)
+
+            self.assertEqual(details[0]["id"], fixture.plugin_id)
+            self.assertEqual(details[0]["releases"][0]["version"], fixture.version)
+            self.assertNotIn("review", details[0]["releases"][0])
+            self.assertEqual(
+                index["plugins"][0]["releases"][0]["review"]["sha256"],
+                fixture.sha256,
+            )
+
     def test_review_hash_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
             review = json.loads(fixture.review_path.read_text(encoding="utf-8"))
             review["sha256"] = "b" * 64
             write_json(fixture.review_path, review)
+            with self.assertRaises(ValidationFailure):
+                self.build_fixture(fixture)
+
+    def test_all_versions_remain_and_use_descending_semver_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            newer = json.loads(fixture.release_path.read_text(encoding="utf-8"))
+            newer["version"] = "1.10.0"
+            newer["publishedAt"] = "2026-08-20T00:00:00Z"
+            newer["releaseNotesUrl"] = (
+                "https://github.com/example/test/releases/tag/v1.10.0"
+            )
+            newer["download"] = {
+                "url": "https://github.com/example/test/releases/download/v1.10.0/dev.example.test-1.10.0.zip",
+                "sha256": "b" * 64,
+                "size": 456,
+            }
+            write_json(
+                fixture.root
+                / "plugins"
+                / fixture.plugin_id
+                / "releases"
+                / "1.10.0.json",
+                newer,
+            )
+
+            index = self.build_fixture(fixture)
+
+            self.assertEqual(
+                [item["version"] for item in index["plugins"][0]["releases"]],
+                ["1.10.0", "1.0.0"],
+            )
+
+    def test_active_plugin_missing_central_history_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            shutil.rmtree(fixture.root / "plugins" / fixture.plugin_id)
+            shutil.rmtree(fixture.root / "reviews" / fixture.plugin_id)
+            with self.assertRaises(ValidationFailure):
+                self.build_fixture(fixture)
+
+    def test_active_plugin_list_contains_only_id_and_repository_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            write_json(
+                fixture.root / "plugins.json",
+                [
+                    {
+                        "id": fixture.plugin_id,
+                        "repositoryUrl": "https://github.com/example/test",
+                        "name": "Metadata belongs in the publisher manifest",
+                    }
+                ],
+            )
+            with self.assertRaises(ValidationFailure):
+                self.build_fixture(fixture)
+
+    def test_archived_plugin_is_allowed_when_every_release_is_yanked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            write_json(fixture.root / "plugins.json", [])
+            release = json.loads(fixture.release_path.read_text(encoding="utf-8"))
+            release["yanked"] = True
+            release["yankReason"] = "Archived by registry administrator."
+            write_json(fixture.release_path, release)
+
+            index = self.build_fixture(fixture)
+
+            self.assertEqual(index["plugins"][0]["id"], fixture.plugin_id)
+            self.assertTrue(index["plugins"][0]["releases"][0]["yanked"])
+
+    def test_archived_plugin_with_an_active_release_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            write_json(fixture.root / "plugins.json", [])
             with self.assertRaises(ValidationFailure):
                 self.build_fixture(fixture)
 
@@ -288,6 +1388,15 @@ class RegistryGenerationTests(unittest.TestCase):
             fixture = RegistryFixture(Path(directory))
             plugin = json.loads(fixture.plugin_path.read_text(encoding="utf-8"))
             plugin["authors"] = ["x" * 257]
+            write_json(fixture.plugin_path, plugin)
+            with self.assertRaises(ValidationFailure):
+                self.build_fixture(fixture)
+
+    def test_central_description_matches_nonempty_publisher_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            plugin = json.loads(fixture.plugin_path.read_text(encoding="utf-8"))
+            plugin["description"] = ""
             write_json(fixture.plugin_path, plugin)
             with self.assertRaises(ValidationFailure):
                 self.build_fixture(fixture)

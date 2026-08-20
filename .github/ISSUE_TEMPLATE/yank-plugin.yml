@@ -1,0 +1,34 @@
+name: Yank Release / 撤回版本
+description: 请求撤回一个或多个已收录版本，同时保留历史记录
+title: "[Yank] "
+labels: ["plugin-yank", "pending-validation"]
+body:
+  - type: input
+    id: plugin-id
+    attributes:
+      label: 插件 ID / Plugin ID
+      placeholder: dev.example.toolbox
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: 版本 / Versions
+      description: 逗号分隔的严格 SemVer；填写 all 表示撤回全部版本。
+      placeholder: 1.0.0, 1.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: 撤回原因 / Reason
+      description: 不要在这里公开可直接利用的漏洞细节，敏感内容请使用 Security Advisory。
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 确认
+      options:
+        - label: 我理解撤回不会删除历史记录，启动器将不再允许安装这些版本
+          required: true

@@ -65,11 +65,30 @@ class PullRequestPolicyTests(unittest.TestCase):
         errors = evaluate([("M", ["repository.json"])])
         self.assertTrue(errors)
 
-    def test_new_release_is_allowed_for_contributor(self):
-        self.assertEqual(
-            evaluate([("A", ["plugins/dev.example.test/releases/1.1.0.json"])]),
-            [],
+    def test_untrusted_actor_is_limited_to_a_strict_document_allowlist(self):
+        self.assertEqual(evaluate([("M", ["README.md"])]), [])
+        for path in ("sitecustomize.py", "unittest.py", "pyproject.toml", ".gitmodules"):
+            with self.subTest(path=path):
+                self.assertTrue(evaluate([("A", [path])]))
+
+    def test_untrusted_actor_cannot_edit_generated_indexes(self):
+        changes = [
+            ("M", ["plugins.json"]),
+            ("M", ["plugin_details.json"]),
+            ("M", ["public/v1/index.json"]),
+        ]
+        self.assertTrue(evaluate(changes))
+
+    def test_new_release_is_issue_managed_for_contributor(self):
+        errors = evaluate([("A", ["plugins/dev.example.test/releases/1.1.0.json"])])
+        self.assertTrue(any("Add Plugin Issue" in error for error in errors))
+
+    def test_new_release_cannot_bypass_issue_sync_in_trusted_pr(self):
+        errors = evaluate(
+            [("A", ["plugins/dev.example.test/releases/1.1.0.json"])],
+            actor="TouristH",
         )
+        self.assertTrue(any("PR 不得新增" in error for error in errors))
 
     def test_historical_release_is_immutable_for_contributor(self):
         errors = evaluate([("M", ["plugins/dev.example.test/releases/1.0.0.json"])])
@@ -89,6 +108,28 @@ class PullRequestPolicyTests(unittest.TestCase):
             actor="TouristH",
         )
         self.assertTrue(any("只能涉及一个插件" in error for error in errors))
+
+    def test_registry_readme_is_not_mistaken_for_a_plugin_id(self):
+        changes = [
+            ("M", ["plugins/README.md"]),
+            ("M", ["plugins/dev.example.test/plugin.json"]),
+        ]
+        self.assertEqual(evaluate(changes, actor="TouristH"), [])
+
+    def test_trusted_actor_can_remove_obsolete_tooling_but_not_plugin_history(self):
+        self.assertEqual(
+            evaluate(
+                [("D", [".github/ISSUE_TEMPLATE/obsolete.yml"])],
+                actor="TouristH",
+            ),
+            [],
+        )
+        self.assertTrue(
+            evaluate(
+                [("D", ["plugins/dev.example.test/releases/1.0.0.json"])],
+                actor="TouristH",
+            )
+        )
 
     def test_renames_are_rejected(self):
         errors = evaluate(

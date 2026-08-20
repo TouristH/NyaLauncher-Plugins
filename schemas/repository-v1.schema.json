@@ -9,7 +9,7 @@
     "$schema": { "type": "string" },
     "schemaVersion": { "type": "integer", "const": 1 },
     "name": { "type": "string", "minLength": 1, "maxLength": 128 },
-    "sourceUrl": { "$ref": "#/$defs/httpsUrl" },
+    "sourceUrl": { "$ref": "#/$defs/githubRepository" },
     "launcherUrl": { "$ref": "#/$defs/httpsUrl" },
     "indexPath": { "const": "public/v1/index.json" },
     "trustedReviewers": {
@@ -24,7 +24,12 @@
     "httpsUrl": {
       "type": "string",
       "format": "uri",
-      "pattern": "^https://[^/@:?#]+(?::443)?(?:[/?#]|$)"
+      "pattern": "^(?!.*[\\s\\\\\\u0000-\\u001F\\u007F])(?!.*%(?![0-9A-Fa-f]{2}))https://(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*(?::443)?(?:[/?#]|$)"
+    },
+    "githubRepository": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$"
     },
     "githubLogin": {
       "type": "string",

@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/publisher-manifest-v1.schema.json",
+  "title": "NyaLauncher publisher _manifest.json v1",
+  "description": "Stable plugin metadata plus the bounded complete history of immutable GitHub Release ZIPs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "id",
+    "name",
+    "description",
+    "authors",
+    "license",
+    "repository_url",
+    "maintainers",
+    "categories",
+    "releases"
+  ],
+  "properties": {
+    "$schema": { "type": "string", "format": "uri", "maxLength": 2048 },
+    "manifest_version": { "type": "integer", "const": 1 },
+    "id": { "$ref": "#/$defs/pluginId" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 8192 },
+    "authors": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+    },
+    "license": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "repository_url": { "$ref": "#/$defs/githubRepository" },
+    "maintainers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/githubLogin" }
+    },
+    "categories": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "appearance",
+          "automation",
+          "gameplay",
+          "integration",
+          "launch",
+          "management",
+          "utilities"
+        ]
+      }
+    },
+    "releases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/release" }
+    }
+  },
+  "$defs": {
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "channel",
+        "published_at",
+        "release_notes_url",
+        "download",
+        "api_version",
+        "minimum_launcher_version",
+        "required_capabilities",
+        "optional_capabilities"
+      ],
+      "properties": {
+        "version": { "$ref": "#/$defs/semver" },
+        "channel": { "enum": ["stable", "preview"] },
+        "published_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "release_notes_url": { "$ref": "#/$defs/githubReleaseNotes" },
+        "download": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["url", "sha256", "size"],
+          "properties": {
+            "url": { "$ref": "#/$defs/githubReleaseZip" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "size": { "type": "integer", "minimum": 1, "maximum": 268435456 }
+          }
+        },
+        "api_version": { "type": "string", "pattern": "^1(?:\\.[0-9]+){1,2}$" },
+        "minimum_launcher_version": { "$ref": "#/$defs/semver" },
+        "maximum_launcher_version_exclusive": { "$ref": "#/$defs/semver" },
+        "required_capabilities": { "$ref": "#/$defs/capabilities" },
+        "optional_capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "pluginId": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:\\.[a-z0-9][a-z0-9-]*)+$"
+    },
+    "semver": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "githubLogin": {
+      "type": "string",
+      "maxLength": 39,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
+    },
+    "httpsUrl": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048,
+      "pattern": "^(?!.*[\\s\\\\\\u0000-\\u001F\\u007F])(?!.*%(?![0-9A-Fa-f]{2}))https://(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*(?::443)?(?:[/?#]|$)"
+    },
+    "githubRepository": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$"
+    },
+    "githubReleaseZip": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048,
+      "pattern": "^(?!.*[\\s\\\\\\u0000-\\u001F\\u007F])(?!.*%(?![0-9A-Fa-f]{2}))https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/[^/?#]+/[^/?#]+\\.zip$"
+    },
+    "githubReleaseNotes": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048,
+      "pattern": "^(?!.*[\\s\\\\\\u0000-\\u001F\\u007F])(?!.*%(?![0-9A-Fa-f]{2}))https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/tag/[^/?#]+(?:/[^?#]+)*$"
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "ui.components",
+          "ui.native",
+          "network.http",
+          "system.info.read",
+          "user-files.read",
+          "user-files.write",
+          "process.start",
+          "minecraft.instance.read",
+          "minecraft.instance.modify",
+          "minecraft.launch.modify"
+        ]
+      }
+    }
+  }
+}

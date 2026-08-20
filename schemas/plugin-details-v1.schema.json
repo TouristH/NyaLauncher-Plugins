@@ -1,20 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/index-v1.schema.json",
-  "title": "NyaLauncher generated plugin index v1",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["schemaVersion", "name", "sourceUrl", "plugins"],
-  "properties": {
-    "schemaVersion": { "type": "integer", "const": 1 },
-    "name": { "type": "string", "minLength": 1, "maxLength": 128 },
-    "sourceUrl": { "$ref": "#/$defs/httpsUrl" },
-    "plugins": {
-      "type": "array",
-      "maxItems": 2048,
-      "items": { "$ref": "#/$defs/plugin" }
-    }
-  },
+  "$id": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/plugin-details-v1.schema.json",
+  "title": "NyaLauncher generated unreviewed plugin details v1",
+  "description": "The complete catalog history before administrator reviews are attached to the launcher index.",
+  "type": "array",
+  "maxItems": 2048,
+  "items": { "$ref": "#/$defs/plugin" },
   "$defs": {
     "httpsUrl": {
       "type": "string",
@@ -25,6 +16,12 @@
       "type": "string",
       "format": "uri",
       "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$"
+    },
+    "githubReleaseZip": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048,
+      "pattern": "^(?!.*[\\s\\\\\\u0000-\\u001F\\u007F])(?!.*%(?![0-9A-Fa-f]{2}))https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/[^/?#]+/[^/?#]+\\.zip$"
     },
     "semver": {
       "type": "string",
@@ -54,8 +51,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id", "name", "description", "authors", "repositoryUrl",
-        "maintainers", "categories", "license", "releases"
+        "id",
+        "name",
+        "description",
+        "authors",
+        "repositoryUrl",
+        "maintainers",
+        "categories",
+        "license",
+        "releases"
       ],
       "properties": {
         "id": {
@@ -67,6 +71,7 @@
         "description": { "type": "string", "minLength": 1, "maxLength": 8192 },
         "authors": {
           "type": "array",
+          "minItems": 1,
           "maxItems": 64,
           "uniqueItems": true,
           "items": { "type": "string", "minLength": 1, "maxLength": 256 }
@@ -90,14 +95,20 @@
           "uniqueItems": true,
           "items": {
             "enum": [
-              "appearance", "automation", "gameplay", "integration",
-              "launch", "management", "utilities"
+              "appearance",
+              "automation",
+              "gameplay",
+              "integration",
+              "launch",
+              "management",
+              "utilities"
             ]
           }
         },
         "license": { "type": "string", "minLength": 1, "maxLength": 256 },
         "releases": {
           "type": "array",
+          "minItems": 1,
           "maxItems": 128,
           "items": { "$ref": "#/$defs/release" }
         }
@@ -107,9 +118,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "version", "channel", "publishedAt", "releaseNotesUrl",
-        "download", "compatibility", "requiredCapabilities",
-        "optionalCapabilities", "yanked"
+        "version",
+        "channel",
+        "publishedAt",
+        "releaseNotesUrl",
+        "download",
+        "compatibility",
+        "requiredCapabilities",
+        "optionalCapabilities",
+        "yanked"
       ],
       "properties": {
         "version": { "$ref": "#/$defs/semver" },
@@ -125,7 +142,7 @@
           "additionalProperties": false,
           "required": ["url", "sha256", "size"],
           "properties": {
-            "url": { "$ref": "#/$defs/httpsUrl" },
+            "url": { "$ref": "#/$defs/githubReleaseZip" },
             "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "size": { "type": "integer", "minimum": 1, "maximum": 268435456 }
           }
@@ -144,8 +161,7 @@
         "requiredCapabilities": { "$ref": "#/$defs/capabilities" },
         "optionalCapabilities": { "$ref": "#/$defs/capabilities" },
         "yanked": { "type": "boolean" },
-        "yankReason": { "type": "string", "minLength": 1, "maxLength": 1024 },
-        "review": { "$ref": "#/$defs/review" }
+        "yankReason": { "type": "string", "minLength": 1, "maxLength": 1024 }
       },
       "allOf": [
         {
@@ -154,29 +170,6 @@
           "else": { "not": { "required": ["yankReason"] } }
         }
       ]
-    },
-    "review": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "status", "reviewedBy", "reviewedAt", "sha256"
-      ],
-      "properties": {
-        "status": { "const": "verified" },
-        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "reviewedBy": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 39,
-          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
-        },
-        "reviewedAt": {
-          "type": "string",
-          "format": "date-time",
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
-        },
-        "notes": { "type": "string", "maxLength": 4096 }
-      }
     }
   }
 }

@@ -11,8 +11,9 @@ plugins/
       └─ 1.1.0.json
 ```
 
-请从仓库根目录的 `templates/` 复制模板，不要把 ZIP、DLL 或 Git submodule
-提交到这里。插件二进制文件应发布在插件作者自己的 GitHub Release 中。
+这个目录由中心仓库同步器维护。插件作者在自己的仓库根目录以升序 `releases[]` 维护
+`_manifest.json` 的完整历史。同步器分批验证缺失的固定 GitHub Release ZIP 后，只新增对应的
+版本 JSON；不要直接提交 ZIP、DLL、Git submodule，也不要手工覆盖已经收录的版本。
 
-插件作者只维护这里的插件与版本元数据。版本级管理员审核位于根目录 `reviews/`，
-只能由 `repository.json` 中的可信审核者通过独立 PR 添加。
+`plugin.json` 保存当前展示元数据，`releases/` 保存完整且不可变的版本历史。
+版本级管理员审核位于根目录 `reviews/`，只能由 `repository.json` 中的可信审核者维护。

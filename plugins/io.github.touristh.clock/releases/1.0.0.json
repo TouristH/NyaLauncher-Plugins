@@ -20,5 +20,6 @@
     "system.info.read"
   ],
   "optionalCapabilities": [],
-  "yanked": false
+  "yanked": true,
+  "yankReason": "固定 GitHub Release ZIP 资产不存在（HTTP 404，2026-08-20 确认）。"
 }

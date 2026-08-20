@@ -1,0 +1,184 @@
+name: Approve or reject plugin issue
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  authorize:
+    if: >-
+      (startsWith(github.event.issue.title, '[Plugin]') ||
+       startsWith(github.event.issue.title, '[Yank]')) &&
+      github.event.comment.body == '/approve' &&
+      (contains(github.event.issue.labels.*.name, 'validated') ||
+       contains(github.event.issue.labels.*.name, 'approved'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted registry code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Authorize trusted approver without entering the write queue
+        run: >-
+          python tools/issue_submission.py authorize
+          --event "$GITHUB_EVENT_PATH"
+          --command approve
+
+  approve:
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: registry-writer
+    concurrency:
+      group: registry-write
+      queue: max
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout trusted registry code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Reject stale approval after a queued rejection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python tools/issue_submission.py check-terminal
+          --event "$GITHUB_EVENT_PATH"
+          --operation approve
+      - name: Revalidate and apply request
+        id: apply
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPROVER: ${{ github.event.comment.user.login }}
+        run: >-
+          python tools/issue_submission.py apply
+          --event "$GITHUB_EVENT_PATH"
+          --actor "$APPROVER"
+          --summary approval-summary.md
+          --github-output "$GITHUB_OUTPUT"
+      - name: Refresh the approved plugin's complete version directory
+        if: steps.apply.outputs.needs_refresh == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NYA_REFRESH_TARGET: ${{ steps.apply.outputs.plugin_id }}
+        run: python tools/validate.py --refresh --write
+      - name: Build the Add approval summary from the verified central snapshot
+        if: steps.apply.outputs.needs_refresh == 'true'
+        run: >-
+          python tools/issue_submission.py summarize
+          --event "$GITHUB_EVENT_PATH"
+          --summary approval-summary.md
+      - name: Rebuild generated views after a yank
+        if: steps.apply.outputs.request_kind == 'yank'
+        run: python tools/validate.py --write
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Commit registry changes
+        id: commit
+        run: |
+          git add -- plugins.json plugins reviews plugin_details.json public/v1/index.json
+          if git diff --cached --quiet; then
+            echo "Request is already reflected in the registry"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -c core.hooksPath=/dev/null commit -m "chore: approve plugin issue #${{ github.event.issue.number }}"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+      - name: Push registry changes with the isolated writer identity
+        if: steps.commit.outputs.has_changes == 'true'
+        env:
+          WRITER_TOKEN: ${{ secrets.NYA_REGISTRY_WRITER_TOKEN }}
+        run: |
+          if [ -z "$WRITER_TOKEN" ]; then
+            echo "::error::NYA_REGISTRY_WRITER_TOKEN is not configured"
+            exit 1
+          fi
+          AUTH_HEADER="$(printf 'x-access-token:%s' "$WRITER_TOKEN" | base64 -w 0)"
+          cleanup_writer_auth() {
+            git config --local --unset-all http.https://github.com/.extraheader || true
+          }
+          trap cleanup_writer_auth EXIT
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $AUTH_HEADER"
+          git -c core.hooksPath=/dev/null push origin HEAD:main
+      - name: Mark Issue approved
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python tools/issue_submission.py complete --event "$GITHUB_EVENT_PATH" --summary approval-summary.md
+
+  authorize-reject:
+    if: >-
+      (startsWith(github.event.issue.title, '[Plugin]') ||
+       startsWith(github.event.issue.title, '[Yank]')) &&
+      startsWith(github.event.comment.body, '/reject')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted registry code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Authorize trusted rejector without entering the write queue
+        run: >-
+          python tools/issue_submission.py authorize
+          --event "$GITHUB_EVENT_PATH"
+          --command reject
+
+  reject:
+    needs: authorize-reject
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: registry-write
+      queue: max
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout trusted registry code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Reject stale rejection after a queued approval
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python tools/issue_submission.py check-terminal
+          --event "$GITHUB_EVENT_PATH"
+          --operation reject
+      - name: Reject request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEWER: ${{ github.event.comment.user.login }}
+        run: python tools/issue_submission.py reject --event "$GITHUB_EVENT_PATH" --actor "$REVIEWER"

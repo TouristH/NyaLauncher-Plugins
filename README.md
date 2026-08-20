@@ -1,75 +1,72 @@
-# NyaLauncher Plugins
+# NyaLauncher 插件中心
 
-NyaLauncher 的独立第三方插件收录仓库。启动器读取本仓库生成的静态索引，
-并从插件作者自己的 GitHub Release 下载插件包。
+[![Validate registry](https://github.com/TouristH/NyaLauncher-Plugins/actions/workflows/validate.yml/badge.svg)](https://github.com/TouristH/NyaLauncher-Plugins/actions/workflows/validate.yml)
+[![NyaLauncher](https://img.shields.io/badge/NyaLauncher-testplug-7c4dff)](https://github.com/redstore-noob/NyaLauncher/tree/testplug)
 
-> 收录不等于安全审计。插件与 NyaLauncher 在同一进程中运行，能力授权不是
-> 操作系统沙箱。请只安装你信任来源的插件。
+NyaLauncher 的独立社区插件索引。插件代码和安装包仍由作者自己的 GitHub 仓库托管，
+本仓库只负责收录来源、保存不可变版本历史、验证发行包并生成启动器读取的静态索引。
 
-## 插件作者如何提交
+插件开发规范以
+[NyaLauncher Plugin Abstractions（testplug）](https://github.com/redstore-noob/NyaLauncher/blob/testplug/NyaLauncher.Plugin.Abstractions/README.md)
+为准。
 
-1. 在你自己的 GitHub 仓库开发插件，并按照
-   [NyaLauncher 插件开发规范](https://github.com/redstore-noob/NyaLauncher/blob/main/NyaLauncher.Plugin.Abstractions/README.md)
-   生成完整插件包。
-2. ZIP 根目录必须直接包含 `plugin.json`、入口 DLL 和私有依赖；不要再套一层目录，
-   也不要打包 `NyaLauncher.Plugin.Abstractions.dll`。
-3. 在你自己的仓库创建一个固定版本 GitHub Release 并上传 ZIP。不要使用
-   `latest`、分支文件或会被覆盖的下载地址。
-4. Fork 本仓库，从 `templates/` 复制模板：
+> 收录不等于代码安全审核。插件是与启动器同进程运行的 .NET 代码，能力授权不是操作系统沙箱。
 
-   ```text
-   plugins/<你的插件 ID>/plugin.json
-   plugins/<你的插件 ID>/releases/<版本>.json
-   ```
+## 工作方式
 
-5. 填写 Release ZIP 的精确字节数和小写 SHA-256：
+本仓库结合了 Issue 收录与固定 Release 包两种机制：
 
-   ```powershell
-   (Get-Item .\plugin.zip).Length
-   (Get-FileHash .\plugin.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-   ```
+1. `plugins.json` 只登记插件 ID 和作者仓库地址。
+2. 插件作者在自己仓库根目录维护 `_manifest.json`，以升序 `releases[]` 保留完整发行历史。
+3. 每个发行版必须是不可变的 GitHub Release ZIP，并声明精确 URL、字节数和 SHA-256。
+4. 自动同步会下载 ZIP，检查包根 `plugin.json`、入口 DLL、兼容性、能力声明和安全路径。
+5. 验证通过的新版本只会追加到该插件自己的历史目录，不会覆盖旧版本。
+6. `public/v1/index.json` 由历史目录和管理员审核记录确定性生成，供启动器下载。
 
-   ```bash
-   stat -c %s plugin.zip
-   sha256sum plugin.zip
-   ```
+```text
+plugins/<plugin-id>/
+├─ plugin.json
+└─ releases/
+   ├─ 1.0.0.json
+   ├─ 1.1.0.json
+   └─ 2.0.0.json
+```
 
-6. 本地运行 `python tools/validate.py --write` 和
-   `python tools/validate.py --check --verify-assets`（Windows 也可使用 `py`），提交条目和
-   生成后的 `public/v1/index.json`，然后发起 Pull Request。
+因此，一个插件始终对应一个完整目录；启动器可以展示并选择仍兼容、未撤回的历史版本。
 
-一次 PR 只提交一个插件或一个新版本。更新插件时新增版本 JSON；已经合并的版本
-下载地址、大小和哈希视为不可变。需要安全下架时请提交 Issue，由仓库维护者标记
-`yanked`，不要删除历史记录。
+## 提交插件
 
-插件作者不应提交或修改 `reviews/`。收录合并后，`repository.json` 中列出的可信审核者
-可以另行添加 `reviews/<插件 ID>/<版本>.json`。审核记录同时绑定插件 ID、严格 SemVer
-版本和 Release ZIP 的 SHA-256；三者任一变化都会使索引生成失败。生成索引仅输出启动器
-所需的 `reviewedBy` 等审核字段，不会把源文件的 `schemaVersion`、`pluginId` 或 `version`
-泄漏到 `release.review`。
+推荐使用 [Add Plugin Issue](../../issues/new?template=add-plugin.yml)，无需 Fork 中心仓库：
 
-## 仓库工作方式
+1. 在作者仓库创建固定 GitHub Release，上传 ZIP。
+2. 在作者仓库根目录添加 `_manifest.json`（示例见
+   [`templates/_manifest.json`](templates/_manifest.json)）。
+3. 创建 Add Plugin Issue，只填写插件 ID 和公开仓库地址。
+4. 维护者输入 `/validate` 触发固定 ZIP 技术验证，通过后使用 `/approve` 收录。
 
-- `plugins/` 保存可审计的插件与版本元数据，不存 DLL、ZIP 或 Git submodule。
-- `tools/validate.py` 严格验证字段、来源 URL、版本、能力、哈希和目录约束，并生成
-  `public/v1/index.json`；CI 还会下载未撤回的 Release，核验实际大小、SHA-256、
-  ZIP 路径、包内清单和入口程序集。
-- `reviews/` 保存由可信审核者签入、与固定版本哈希精确绑定的管理员审核记录。
-- Pull Request CI 确认索引是确定性生成的，并根据 PR 作者身份保护审核记录、校验器、
-  schema、工作流和仓库配置。
-- NyaLauncher 只读取 `public/v1/index.json`，下载后仍会二次核验大小、SHA-256、
-  ZIP 路径和包内运行时清单。
+首次收录后，作者发布新版本只需创建新的 Release，并把新项追加到 `_manifest.json` 的完整
+`releases[]`。同步任务会以有界批次将缺失版本追加到 `plugins/<id>/releases/`，不会因两次采样间
+连续发布而漏版。同一个版本号的 URL、大小、哈希或兼容信息一旦进入中心仓库便不可更改；需要修复时
+必须发布新版本号。
 
-> `verified` 表示可信审核者核对过这一份固定哈希的包及其声明，不是代码绝对安全的保证，
-> 也不是操作系统级沙箱。
+完整要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-## 维护者设置
+## 收录与审核是两件事
 
-GitHub 上应保护 `main` 分支：要求 Pull Request、要求 CODEOWNERS 审核、要求
-`Validate registry / validate` 状态检查通过，并禁止绕过和直接推送。CI 从目标分支的
-`repository.json` 读取 `trustedReviewers`，因此 PR 不能通过把自己加入列表来获得审核权限。
+- **已收录（listed）**：版本通过格式、哈希、ZIP 与运行时清单验证，可以出现在仓库中；不代表管理员读过代码。
+- **管理员已审核（verified）**：可信审核者审查了精确的插件 ID、版本和 ZIP SHA-256，启动器显示绿色标志。
+- **未经审核**：启动器显示醒目警告，并在下载前要求用户再次确认风险。
 
-## 索引地址
+审核记录位于 `reviews/<插件 ID>/<版本>.json`。如果同版本包的 SHA-256 发生变化，审核不会迁移，
+而是使验证失败。管理员可以删除审核记录撤销绿色标志，并将风险版本标记为 `yanked`。
+
+## 公开文件
+
+- [`plugins.json`](plugins.json)：已收录作者仓库列表。
+- [`plugin_details.json`](plugin_details.json)：从完整历史目录生成的展示数据。
+- [`public/v1/index.json`](public/v1/index.json)：NyaLauncher 使用的严格 v1 索引。
+
+启动器固定索引地址：
 
 ```text
 https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/public/v1/index.json
@@ -77,5 +74,4 @@ https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/public/v1/in
 
 ## 许可证
 
-仓库工具和元数据结构使用 [MIT](LICENSE) 许可证。每个插件及其二进制包仍按插件
-作者声明的许可证发布。
+仓库工具与元数据格式使用 [MIT](LICENSE)。插件及其二进制包仍按各自声明的许可证发布。

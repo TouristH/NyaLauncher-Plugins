@@ -1,0 +1,51 @@
+name: Add Plugin / 收录插件
+description: 从公开作者仓库的 _manifest.json 收录插件
+title: "[Plugin] "
+labels: ["plugin-submission", "pending-validation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        作者仓库根目录必须包含 `_manifest.json`，其升序 `releases[]` 必须保留完整发行历史，
+        每个版本均指向固定 GitHub Release ZIP。可信维护者输入 `/validate` 后才会下载本轮有界候选，
+        并核对大小、SHA-256、包内 `plugin.json` 和入口 DLL。
+  - type: input
+    id: plugin-id
+    attributes:
+      label: 插件 ID / Plugin ID
+      description: 必须与作者 `_manifest.json` 及 ZIP 内 `plugin.json` 完全一致。
+      placeholder: dev.example.toolbox
+    validations:
+      required: true
+  - type: input
+    id: repository-url
+    attributes:
+      label: 仓库地址 / Repository URL
+      description: 公开 GitHub 仓库根地址，不要填写 .git、分支或文件 URL。
+      placeholder: https://github.com/example/nya-toolbox
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 发布确认 / Release checklist
+      options:
+        - label: 仓库默认分支根目录包含符合模板的 `_manifest.json`
+          required: true
+        - label: `_manifest.json` 的 releases[] 完整保留所有版本，且每项指向固定标签 Release ZIP
+          required: true
+        - label: ZIP 根目录直接包含 `plugin.json` 和入口 DLL
+          required: true
+        - label: 我已核对 ZIP 的精确字节数和小写 SHA-256
+          required: true
+        - label: 我有权发布该插件及其依赖，并已如实声明能力和风险
+          required: true
+        - label: 我理解“收录”不等于“管理员已审核”，未经审核版本会向用户显示风险警告
+          required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: 补充说明 / Notes
+      description: 可选。请说明用途、特殊依赖或测试方式。
+    validations:
+      required: false

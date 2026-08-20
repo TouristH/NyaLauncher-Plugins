@@ -1,0 +1,65 @@
+name: Refresh publisher manifests
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: registry-writer
+    concurrency:
+      group: registry-write
+      queue: max
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Fetch publisher manifests and hard-verify only the bounded new batch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NYA_REFRESH_OFFSET: ${{ github.run_number }}
+        run: python tools/validate.py --refresh --write --best-effort
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Commit appended versions
+        id: commit
+        run: |
+          git add -- plugins plugin_details.json public/v1/index.json
+          if git diff --cached --quiet; then
+            echo "No publisher changes"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -c core.hooksPath=/dev/null commit -m "chore: refresh plugin releases"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+      - name: Push refreshed history with the isolated writer identity
+        if: steps.commit.outputs.has_changes == 'true'
+        env:
+          WRITER_TOKEN: ${{ secrets.NYA_REGISTRY_WRITER_TOKEN }}
+        run: |
+          if [ -z "$WRITER_TOKEN" ]; then
+            echo "::error::NYA_REGISTRY_WRITER_TOKEN is not configured"
+            exit 1
+          fi
+          AUTH_HEADER="$(printf 'x-access-token:%s' "$WRITER_TOKEN" | base64 -w 0)"
+          cleanup_writer_auth() {
+            git config --local --unset-all http.https://github.com/.extraheader || true
+          }
+          trap cleanup_writer_auth EXIT
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $AUTH_HEADER"
+          git -c core.hooksPath=/dev/null push origin HEAD:main

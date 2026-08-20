@@ -1,0 +1,38 @@
+name: Request Review / 请求管理员审核
+description: 请求对某个固定版本进行人工审核；不会自动获得绿色标志
+title: "[Review] "
+labels: ["review-request"]
+body:
+  - type: input
+    id: plugin-id
+    attributes:
+      label: 插件 ID / Plugin ID
+      placeholder: dev.example.toolbox
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / Version
+      placeholder: 1.2.0
+    validations:
+      required: true
+  - type: input
+    id: source-commit
+    attributes:
+      label: 对应源码提交 / Source commit
+      description: 建议填写构建该 Release ZIP 的完整 Git commit URL。
+    validations:
+      required: true
+  - type: textarea
+    id: build-notes
+    attributes:
+      label: 构建与审核说明 / Build and review notes
+      description: 说明依赖、构建命令、测试方法及高风险能力用途。
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        管理员审核是人工流程，精确绑定插件 ID、版本和 Release ZIP SHA-256。
+        请求被接受并不保证一定获得 `verified` 标志。

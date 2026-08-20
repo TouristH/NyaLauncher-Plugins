@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Enforce scoped plugin PRs, immutable releases, and trusted review changes."""
+"""Protect the Issue-managed registry, immutable releases, and admin reviews."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -12,17 +13,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROTECTED_PREFIXES = (
-    ".github/",
-    "reviews/",
-    "schemas/",
-    "templates/",
-    "tests/",
-    "tools/",
-)
-PROTECTED_FILES = {
-    ".gitattributes",
-    "repository.json",
+PLUGIN_ID = re.compile(r"^[a-z][a-z0-9]*(?:\.[a-z0-9][a-z0-9-]*)+$")
+UNTRUSTED_ALLOWED_FILES = {
+    "README.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CODE_OF_CONDUCT.md",
+    "LICENSE",
 }
 
 
@@ -82,9 +79,14 @@ def is_release_path(path: str) -> bool:
 
 def plugin_id_from_path(path: str) -> str | None:
     parts = normalize(path).split("/")
-    if len(parts) >= 2 and parts[0] == "plugins":
+    if len(parts) >= 2 and parts[0] == "plugins" and PLUGIN_ID.fullmatch(parts[1]):
         return parts[1]
-    if len(parts) >= 3 and parts[0] == "reviews" and parts[-1].endswith(".json"):
+    if (
+        len(parts) >= 3
+        and parts[0] == "reviews"
+        and PLUGIN_ID.fullmatch(parts[1])
+        and parts[-1].endswith(".json")
+    ):
         return parts[1]
     return None
 
@@ -110,19 +112,30 @@ def evaluate_policy(
             errors.append(f"不能重命名已收录文件：{' -> '.join(paths)}")
             continue
         if status.startswith("D"):
-            if not actor_is_trusted or not all(path.startswith("reviews/") for path in paths):
+            if not actor_is_trusted:
                 errors.append(f"不能删除已收录文件：{paths[0]}")
+            elif any(
+                path.startswith("plugins/") and path != "plugins/README.md"
+                for path in paths
+            ):
+                errors.append(f"不能删除插件历史目录中的文件：{paths[0]}")
 
         for path in paths:
-            if is_release_path(path) and status != "A":
-                if not actor_is_trusted:
-                    errors.append(f"历史版本文件不可修改，只能新增版本：{path}")
+            if is_release_path(path):
+                if status == "A":
+                    errors.append(
+                        f"新版本只能由 Add Plugin Issue 或受信同步工作流写入，PR 不得新增：{path}"
+                    )
+                elif not actor_is_trusted:
+                    errors.append(f"历史版本文件不可修改：{path}")
                 elif not status.startswith("D") and not is_yank_only(path):
                     errors.append(f"历史版本只能由可信审核者执行 yanked-only 修改：{path}")
 
-            is_protected = path.startswith(PROTECTED_PREFIXES) or path in PROTECTED_FILES
-            if is_protected and not actor_is_trusted:
-                errors.append(f"非可信账号 {actor} 不能修改维护者保护文件：{path}")
+            if not actor_is_trusted and path not in UNTRUSTED_ALLOWED_FILES:
+                errors.append(
+                    f"非可信账号 {actor} 的 PR 只能修改明确允许的根目录文档，不能修改：{path}；"
+                    "插件发布请使用 Add Plugin Issue"
+                )
             if (
                 actor_is_trusted
                 and path.startswith("reviews/")
@@ -148,11 +161,11 @@ def load_trusted_reviewers(base: str) -> set[str]:
     return {item.casefold() for item in reviewers}
 
 
-def yank_only_change(base: str, path: str) -> bool:
+def yank_only_change(base: str, path: str, head: str = "HEAD") -> bool:
     try:
         previous = json.loads(git("show", f"{base}:{path}"))
-        current = json.loads((ROOT / path).read_text(encoding="utf-8"))
-    except (subprocess.CalledProcessError, OSError, UnicodeError, json.JSONDecodeError):
+        current = json.loads(git("show", f"{head}:{path}"))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         return False
     if not isinstance(previous, dict) or not isinstance(current, dict):
         return False
@@ -170,10 +183,10 @@ def yank_only_change(base: str, path: str) -> bool:
     )
 
 
-def review_actor_matches(path: str, actor: str) -> bool:
+def review_actor_matches(path: str, actor: str, head: str = "HEAD") -> bool:
     try:
-        value = json.loads((ROOT / path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        value = json.loads(git("show", f"{head}:{path}"))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         return False
     return (
         isinstance(value, dict)
@@ -185,22 +198,28 @@ def review_actor_matches(path: str, actor: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", required=True, help="trusted base commit SHA")
+    parser.add_argument("--head", default="HEAD", help="candidate commit or fetched ref")
     parser.add_argument("--actor", required=True, help="pull request author login")
     args = parser.parse_args()
     base = args.base.strip()
+    head = args.head.strip()
     actor = args.actor.strip()
     if (
         not base
         or any(character not in "0123456789abcdefABCDEF" for character in base)
+        or not head
+        or head.startswith("-")
+        or ".." in head
+        or re.fullmatch(r"[A-Za-z0-9_./-]+", head) is None
         or not actor
     ):
-        print("无效的 PR base SHA 或 actor", file=sys.stderr)
+        print("无效的 PR base SHA、head ref 或 actor", file=sys.stderr)
         return 1
 
     try:
         trusted_reviewers = load_trusted_reviewers(base)
         changes = parse_name_status(
-            git("diff", "--name-status", "-z", "--find-renames", f"{base}...HEAD")
+            git("diff", "--name-status", "-z", "--find-renames", f"{base}...{head}")
         )
     except (subprocess.CalledProcessError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -210,8 +229,8 @@ def main() -> int:
         changes,
         actor,
         trusted_reviewers,
-        lambda path: yank_only_change(base, path),
-        review_actor_matches,
+        lambda path: yank_only_change(base, path, head),
+        lambda path, candidate_actor: review_actor_matches(path, candidate_actor, head),
     )
     if errors:
         for error in errors:

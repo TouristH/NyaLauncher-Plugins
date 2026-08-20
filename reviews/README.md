@@ -1,17 +1,14 @@
-# 管理员版本审核
+# 管理员审核记录
 
-管理员审核按插件版本和 Release 资产的精确 SHA-256 绑定：
+本目录只允许 `repository.json.trustedReviewers` 中的可信审核者修改。
 
 ```text
-reviews/
-└─ dev.example.toolbox/
-   └─ 1.0.0.json
+reviews/<plugin-id>/<strict-semver>.json
 ```
 
-只有 `repository.json` 中 `trustedReviewers` 列出的维护者可以提交或修改审核文件。
-生成器只会在 `pluginId`、`version` 和 `sha256` 与收录版本完全一致时，把审核合并为
-公开索引中的 `release.review.status = "verified"`。源字段 `reviewer` 会映射为
-`reviewedBy`；源文件的 `schemaVersion`、`pluginId` 和 `version` 不会进入公开审核对象。
+审核必须绑定插件 ID、版本和该固定 GitHub Release ZIP 的小写 SHA-256。启动器公开索引只会输出
+`status: verified`、`reviewedBy`、`reviewedAt`、`sha256` 与可选说明；作者无法通过自己的
+`_manifest.json` 写入绿色审核标志。
 
-审核表示维护者核对了该固定二进制资产及其元数据，并不表示插件代码绝对安全，也
-不替代用户对插件来源和能力授权的判断。请从 `templates/review.json` 复制模板。
+审核前至少应核对源仓库、依赖、能力声明、构建来源和最终 ZIP 哈希。撤销审核时删除记录；
+如版本存在风险，还应将对应历史版本标记为 `yanked`。
