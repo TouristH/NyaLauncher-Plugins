@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/publisher-manifest-v1.schema.json",
   "manifest_version": 1,
-  "id": "dev.example.toolbox",
+  "id": "io.github.example.toolbox",
   "name": "Example Toolbox",
   "description": "一句话说明插件提供的功能。",
   "authors": [
@@ -22,7 +22,7 @@
       "published_at": "2026-08-20T00:00:00Z",
       "release_notes_url": "https://github.com/example/nya-toolbox/releases/tag/v1.0.0",
       "download": {
-        "url": "https://github.com/example/nya-toolbox/releases/download/v1.0.0/dev.example.toolbox-1.0.0.zip",
+        "url": "https://github.com/example/nya-toolbox/releases/download/v1.0.0/io.github.example.toolbox-1.0.0.zip",
         "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
         "size": 123456
       },

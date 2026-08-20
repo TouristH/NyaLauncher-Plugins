@@ -1,11 +1,13 @@
 {
   "$schema": "../../schemas/review-v1.schema.json",
   "schemaVersion": 1,
-  "pluginId": "dev.example.toolbox",
+  "pluginId": "io.github.example.toolbox",
   "version": "1.0.0",
   "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "status": "verified",
-  "reviewer": "TouristH",
-  "reviewedAt": "2026-08-13T00:00:00Z",
+  "stateBy": "TouristH",
+  "stateAt": "2026-08-13T00:00:00Z",
+  "lastCommandAt": "2026-08-13T00:00:00Z",
+  "lastCommentId": 123456789,
   "notes": "已核对固定 Release 资产、包结构与声明能力。"
 }

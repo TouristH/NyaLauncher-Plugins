@@ -1,4 +1,4 @@
-name: Approve yank or reject plugin issue
+name: Apply administrator plugin review
 
 on:
   issue_comment:
@@ -7,12 +7,11 @@ on:
 permissions: {}
 
 jobs:
-  authorize-yank:
+  authorize:
     if: >-
-      startsWith(github.event.issue.title, '[Yank]') &&
-      github.event.comment.body == '/approve' &&
-      contains(github.event.issue.labels.*.name, 'plugin-yank') &&
-      contains(github.event.issue.labels.*.name, 'pending-review')
+      startsWith(github.event.issue.title, '[Review]') &&
+      (startsWith(github.event.comment.body, '/verify ') ||
+       startsWith(github.event.comment.body, '/revoke-review '))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -27,14 +26,11 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - name: Authorize trusted yank approver before entering the write queue
-        run: >-
-          python tools/issue_submission.py authorize
-          --event "$GITHUB_EVENT_PATH"
-          --command approve
+      - name: Authorize the exact trusted review command
+        run: python tools/review_bot.py authorize --event "$GITHUB_EVENT_PATH"
 
-  yank:
-    needs: authorize-yank
+  review:
+    needs: authorize
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -54,23 +50,14 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - name: Reject a stale approval after a queued rejection
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          python tools/issue_submission.py check-terminal
-          --event "$GITHUB_EVENT_PATH"
-          --operation approve
-      - name: Revalidate and apply the yank request locally
+      - name: Revalidate the exact artifact and apply the review locally
         id: apply
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPROVER: ${{ github.event.comment.user.login }}
         run: >-
-          python tools/issue_submission.py apply
+          python tools/review_bot.py apply
           --event "$GITHUB_EVENT_PATH"
-          --actor "$APPROVER"
-          --summary approval-summary.md
+          --summary review-summary.md
           --github-output "$GITHUB_OUTPUT"
       - name: Rebuild generated views
         run: python tools/validate.py --write
@@ -78,13 +65,13 @@ jobs:
         run: python tools/validate.py --check
       - name: Run regression tests
         run: python -m unittest discover -s tests -v
-      - name: Stage only yank data
+      - name: Stage only review data
         id: changes
         run: |
-          git add -- plugins.json plugins reviews plugin_details.json public/v1/index.json
+          git add -- reviews public/v1/index.json
           git diff --cached --check
           if git diff --cached --quiet; then
-            echo "The yank is already reflected in main"
+            echo "The exact review state is already reflected in main"
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -103,14 +90,17 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          BRANCH: registry-bot/yank/issue-${{ github.event.issue.number }}
-          ISSUE_URL: ${{ github.event.issue.html_url }}
+          BRANCH: registry-bot/review/issue-${{ github.event.issue.number }}
+          REVIEW_ACTION: ${{ steps.apply.outputs.action }}
+          PLUGIN_ID: ${{ steps.apply.outputs.plugin_id }}
+          VERSION: ${{ steps.apply.outputs.version }}
+          SHA256: ${{ steps.apply.outputs.sha256 }}
         run: |
           set -euo pipefail
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
           git -c core.hooksPath=/dev/null commit \
-            -m "chore: yank plugin release from issue #${{ github.event.issue.number }}"
+            -m "chore: ${REVIEW_ACTION} ${PLUGIN_ID} ${VERSION}"
 
           AUTH_HEADER="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
           cleanup_writer_auth() {
@@ -128,6 +118,9 @@ jobs:
             git -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${BRANCH}"
           fi
 
+          printf 'Applies trusted administrator command `%s` to `%s@%s` at fixed SHA-256 `%s`.\n\nCloses #%s\n' \
+            "$REVIEW_ACTION" "$PLUGIN_ID" "$VERSION" "$SHA256" \
+            "${{ github.event.issue.number }}" > review-pr-body.md
           PR_DATA="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
             -f state=open -f base=main \
             -f "head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}" -f per_page=100 | \
@@ -136,9 +129,11 @@ jobs:
           PR_NUMBER="$(jq -r '.number // empty' <<<"$PR_DATA")"
           if [ -z "$PR_NUMBER" ]; then
             PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
-              --title "chore: approve yank request #${{ github.event.issue.number }}" \
-              --body "Applies the trusted maintainer yank request from ${ISSUE_URL}. Closes #${{ github.event.issue.number }}")"
+              --title "chore: ${REVIEW_ACTION} ${PLUGIN_ID} ${VERSION}" \
+              --body-file review-pr-body.md)"
             PR_NUMBER="$(gh pr view "$PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
+          else
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file review-pr-body.md
           fi
 
           PR_STATE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
@@ -171,68 +166,52 @@ jobs:
           done
           echo "::error::Timed out waiting for Registry App PR #${PR_NUMBER} to merge"
           exit 1
-      - name: Mark the Issue approved only after main contains the yank
+      - name: Publish the terminal review result only after main is updated
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          python tools/issue_submission.py complete
-          --event "$GITHUB_EVENT_PATH"
-          --summary approval-summary.md
-
-  authorize-reject:
-    if: >-
-      (startsWith(github.event.issue.title, '[Plugin]') ||
-       startsWith(github.event.issue.title, '[Yank]')) &&
-      startsWith(github.event.comment.body, '/reject')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout trusted registry code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-      - name: Authorize trusted rejector without entering the write queue
-        run: >-
-          python tools/issue_submission.py authorize
-          --event "$GITHUB_EVENT_PATH"
-          --command reject
-
-  reject:
-    needs: authorize-reject
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: registry-write
-      queue: max
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - name: Checkout trusted registry code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-      - name: Reject stale rejection after a queued approval
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          python tools/issue_submission.py check-terminal
-          --event "$GITHUB_EVENT_PATH"
-          --operation reject
-      - name: Reject request
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REVIEWER: ${{ github.event.comment.user.login }}
-        run: python tools/issue_submission.py reject --event "$GITHUB_EVENT_PATH" --actor "$REVIEWER"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_ACTION: ${{ steps.apply.outputs.action }}
+        run: |
+          set -euo pipefail
+          if [ "$REVIEW_ACTION" = "verify" ]; then
+            TERMINAL_LABEL="verified"
+            OPPOSITE_LABEL="review-revoked"
+            gh label create verified --repo "$GITHUB_REPOSITORY" \
+              --color 0e8a16 --description "Exact plugin artifact verified by an administrator" --force
+          else
+            TERMINAL_LABEL="review-revoked"
+            OPPOSITE_LABEL="verified"
+            gh label create review-revoked --repo "$GITHUB_REPOSITORY" \
+              --color b60205 --description "Administrator verification was revoked" --force
+          fi
+          delete_label_unless_missing() {
+            local label="$1"
+            local delete_error
+            delete_error="$(mktemp)"
+            if ! gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/issues/${{ github.event.issue.number }}/labels/${label}" \
+              >/dev/null 2>"$delete_error"; then
+              if ! grep -q "HTTP 404" "$delete_error"; then
+                cat "$delete_error" >&2
+                rm -f "$delete_error"
+                return 1
+              fi
+            fi
+            rm -f "$delete_error"
+          }
+          MARKER="<!-- nya-registry-review:${REVIEW_ACTION}:${{ github.event.comment.id }} -->"
+          FOUND="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/issues/${{ github.event.issue.number }}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"${MARKER}\"))) | .id" \
+            | head -n 1)"
+          if [ -z "$FOUND" ]; then
+            printf '\n%s\n' "$MARKER" >> review-summary.md
+            gh issue comment "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" \
+              --body-file review-summary.md
+          fi
+          delete_label_unless_missing "$OPPOSITE_LABEL"
+          gh issue edit "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" \
+            --add-label "$TERMINAL_LABEL"
+          delete_label_unless_missing review-request
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/issues/${{ github.event.issue.number }}" \
+            -f state=closed >/dev/null

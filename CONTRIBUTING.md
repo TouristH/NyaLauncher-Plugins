@@ -51,7 +51,7 @@ sha256sum plugin.zip
 {
   "$schema": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/publisher-manifest-v1.schema.json",
   "manifest_version": 1,
-  "id": "dev.example.toolbox",
+  "id": "io.github.example.toolbox",
   "name": "Example Toolbox",
   "description": "示例工具插件。",
   "authors": ["Example Team"],
@@ -66,7 +66,7 @@ sha256sum plugin.zip
       "published_at": "2026-08-20T12:00:00Z",
       "release_notes_url": "https://github.com/example/nya-toolbox/releases/tag/v1.2.0",
       "download": {
-        "url": "https://github.com/example/nya-toolbox/releases/download/v1.2.0/dev.example.toolbox-1.2.0.zip",
+        "url": "https://github.com/example/nya-toolbox/releases/download/v1.2.0/io.github.example.toolbox-1.2.0.zip",
         "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "size": 123456
       },
@@ -95,35 +95,47 @@ appearance automation gameplay integration launch management utilities
 版本中优先选择最新版本，再按 SemVer 降序选取；单轮最多验证 16 个、声明大小合计最多 512 MiB。
 批内所有 ZIP 全部通过后才会一起写入；其余较旧版本由后续轮次继续回填。
 
-## 4. 使用 Issue 首次收录
+## 4. 自动首次收录
 
-创建 [Add Plugin Issue](../../issues/new?template=add-plugin.yml)，填写：
+自动收录的插件 ID 必须使用仓库所有者可验证的 GitHub 名空间：
 
-- 与 `_manifest.json` 完全一致的插件 ID；
-- 插件公开 GitHub 仓库根地址。
+```text
+io.github.<仓库 owner 小写>.<插件名>
+```
 
-Issue 创建后保持 `pending-validation`。可信维护者确认来源后输入 `/validate`，工作流才会读取默认
-分支根目录的 `_manifest.json`、下载本轮有界 Release ZIP 并检查哈希与包内容。公网作者输入命令
-不会触发重资产下载。
+例如 `https://github.com/example/nya-toolbox` 使用 `io.github.example.toolbox`。这条规则防止公开
+Topic 仓库抢占别人的插件 ID；需要使用自有域名 ID 时，应先由管理员核验域名所有权。
+首次收录还会把 GitHub 的 `repositoryId` 与 `ownerId` 固定到 `plugins.json`。仓库或账号改名、
+转移以及旧路径被重新占用都不会自动继承发布权，必须由管理员核验并迁移身份记录。
+
+完成 Release 与 `_manifest.json` 后，给作者仓库添加 `nyalauncher-plugin` Topic。定时机器人会：
+
+1. 搜索公开、非 Fork、未归档仓库；
+2. 下载并静态校验 `_manifest.json`；
+3. 在全局资源预算内验证固定 ZIP、SHA-256 与运行时清单；
+4. 创建同仓 `registry-bot/sync` PR；
+5. 在可信策略与完整测试通过后自动合并。
+
+成功收录的版本立即出现在索引中，但默认是“未审核”。不需要管理员输入 `/validate` 或
+`/approve`。GitHub Topic 索引延迟时，可以创建
+[Plugin Queue Issue](../../issues/new?template=add-plugin.yml)；Issue 候选在同一有界机器人任务中优先
+处理，不会因为打开 Issue 就单独触发大文件下载。
+
 状态含义：
 
 | 状态 | 含义 |
 | --- | --- |
-| `pending-validation` | 等待验证 |
-| `validated` | 技术验证通过，等待维护者决定是否收录 |
-| `validation-failed` | 验证失败；修复作者仓库后请维护者再次输入 `/validate` |
-| `approved` | 已加入中心仓库 |
-| `rejected` | 维护者拒绝收录 |
-
-维护者使用 `/approve` 批准，或使用 `/reject 原因` 拒绝。技术验证通过只代表包符合规则，
-并不自动获得绿色“管理员已审核”标志。
+| `queued-for-intake` | 已进入自动收录队列 |
+| `validation-failed` | 清单或固定包不合规；修复后关闭并重新打开 Issue 以重新排队 |
+| `pending-merge` | 机器人 PR 正在等待必需检查与自动合并 |
+| `listed-unreviewed` | 已收录，但尚无管理员绿色审核标志 |
 
 ## 5. 发布后续版本
 
 1. 增加版本号并重新构建插件。
 2. 创建新的固定 GitHub Release 和 ZIP 资产。
 3. 将新版本项按 SemVer 升序追加到 `_manifest.json` 的 `releases[]`；不得替换或删除旧项。
-4. 等待每 6 小时的定时同步；仓库维护者也可手动运行 `Refresh publisher manifests` workflow_dispatch。
+4. 等待定时同步；仓库维护者也可手动运行 `Refresh publisher manifests` workflow_dispatch。
 
 同步器只会新增 `plugins/<id>/releases/<version>.json`。已有版本的 URL、大小、SHA-256、
 兼容性或能力声明不能被覆盖。常规定时同步不会反复下载既有 ZIP；若作者在同一 URL 重传资产，
@@ -135,15 +147,29 @@ Issue 创建后保持 `pending-validation`。可信维护者确认来源后输�
 ## 6. 下架与安全问题
 
 不要删除历史版本。创建 Remove/Yank Issue，维护者会将相关版本设为 `yanked: true` 并写明原因。
-启动器不会提供已撤回版本的安装入口，但历史记录仍保留用于审计。
+启动器不会提供已撤回版本的安装入口，但历史记录与发布者 numeric identity 指针仍保留用于审计和
+发现后续修复版本。
 
-管理员审核是独立流程。只有 `repository.json.trustedReviewers` 中的维护者可以创建或撤销
-`reviews/<id>/<version>.json`；审核精确绑定该版本 ZIP 的 SHA-256。
+管理员审核是独立流程。作者可创建 Review Issue，机器人会显示中心记录的 canonical SHA-256。
+管理员完成源码、依赖、能力和行为检查后执行完整命令：
+
+```text
+/verify io.github.example.toolbox@1.2.0 sha256:<64 位小写哈希> 可选审核说明
+```
+
+只有 `repository.json.trustedReviewers` 中的账号可执行。审核机器人不会信任可编辑的 Issue 正文，
+而是再次用命令中的 ID、版本和 SHA-256 查询中心历史、重新下载固定 ZIP 并完整验证，然后通过
+`registry-bot/review/*` PR 写入 `reviews/<id>/<version>.json`。撤销绿色标志使用：
+
+```text
+/revoke-review io.github.example.toolbox@1.2.0 sha256:<同一哈希> 撤销原因
+```
 
 ## Pull Request
 
-普通插件提交请使用 Issue，避免多人同时修改中心索引。Pull Request 主要用于维护仓库工具、
-文档和由可信审核者添加审核记录；CI 会阻止普通贡献者直接更改生成索引或历史版本。
+普通插件发布使用 Topic 或 Issue 兜底，避免多人同时修改中心索引。自动收录、版本同步、撤回与审核
+均由同仓机器人 PR 写入；普通 Pull Request 主要用于维护工具和文档。CI 会阻止普通贡献者直接更改
+生成索引、历史版本或审核记录。
 
 仓库管理员应保护 `main`：所有人工变更必须走 PR，并将
 `Enforce trusted registry policy / policy` 与 `Validate registry / validate` 设为必需检查。
@@ -152,16 +178,15 @@ Issue 创建后保持 `pending-validation`。可信维护者确认来源后输�
 （strict/up-to-date），避免旧 PR 沿用旧版可信名单或策略结果。当前工作流未声明 `merge_group`，
 因此在补齐对应触发器前不要启用 Merge Queue。
 
-`approve-issue.yml` 与 `refresh.yml` 是唯一需要直接追加生成数据的写入流程。上线前必须创建受保护的
-`registry-writer` Environment，并在其中配置 `NYA_REGISTRY_WRITER_TOKEN`：它应是专用机器人账号的
-fine-grained token，只授予本仓库 Contents 写入权限。Issue 标签、评论和读取公开 Release 继续使用
-权限受限的工作流 `GITHUB_TOKEN`。checkout 不持久化凭据；专用令牌只在最终 push 步骤中临时注入，
-该步骤禁用 Git hooks，退出时会清除本地认证头。规则集只给这个机器人身份 bypass；
-普通 `GITHUB_TOKEN` 无法把 bypass 精确限制到某两个工作流。Environment 只允许 `main` 上的受信工作流
-使用，但不要设置会让定时同步永久等待的人工审批门。
+写入身份是只安装在本仓库的 GitHub App。工作流完成所有不可信输入处理和回归测试后，才用
+`NYA_REGISTRY_APP_CLIENT_ID` 与 `NYA_REGISTRY_APP_PRIVATE_KEY` 申请一小时短期 installation token，
+向 `registry-bot/*` 分支推送并创建 PR。App 不得获得 `main` bypass；合并必须经过 base-owned policy、
+完整 validator 和 strict/up-to-date 规则。Issue 标签与评论继续使用权限受限的 `GITHUB_TOKEN`。
+另需用 ruleset 将 `registry-bot/**` 分支的创建和更新限制为该 App；policy 还会核对每次 PR 事件的
+sender，防止普通写权限协作者接管已有机器人 PR。
 
-不要给普通维护者、通用 Actions 身份或无关第三方 App 开放直接推送。若暂时无法配置专用机器人，
-应把写入改为由机器人创建 PR，而不是关闭 `main` 保护。
+不要配置长期 `NYA_REGISTRY_WRITER_TOKEN`，也不要给普通维护者或通用 Actions 身份直接推送权限。
+完整部署步骤见 [docs/REGISTRY_BOT.md](docs/REGISTRY_BOT.md)。
 
 ## 运维提醒
 

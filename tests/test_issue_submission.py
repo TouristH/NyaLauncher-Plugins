@@ -179,16 +179,68 @@ dev.example.test
                 "plugin-submission",
                 "plugin-yank",
                 "review-request",
-                "pending-validation",
+                "queued-for-intake",
+                "pending-review",
             },
         )
         self.assertIn(
             (
                 "POST",
                 "issues/9/labels",
-                {"labels": ["plugin-submission", "pending-validation"]},
+                {"labels": ["plugin-submission", "queued-for-intake"]},
             ),
             calls,
+        )
+
+    def test_review_initialization_resolves_canonical_hash_for_prompt(self):
+        sha256 = "a" * 64
+        event = {
+            "issue": {
+                "number": 10,
+                "title": "[Review] io.github.example.test 1.2.3",
+                "body": (
+                    "### 插件 ID / Plugin ID\n\nio.github.example.test\n\n"
+                    "### 版本 / Version\n\n1.2.3\n"
+                ),
+            }
+        }
+        catalog = [
+            {
+                "id": "io.github.example.test",
+                "releases": [
+                    {
+                        "version": "1.2.3",
+                        "yanked": False,
+                        "download": {"sha256": sha256},
+                    }
+                ],
+            }
+        ]
+        calls = []
+
+        def api(_event, method, path, body=None):
+            calls.append((method, path, body))
+            return [] if method == "GET" else {}
+
+        with (
+            patch.object(
+                submission,
+                "github_context",
+                return_value=("TouristH/NyaLauncher-Plugins", 10, "token"),
+            ),
+            patch.object(submission, "github_api", side_effect=api),
+            patch.object(submission.validator, "load_catalog", return_value=catalog),
+        ):
+            submission.initialize_issue(event)
+
+        prompt = next(
+            body["body"]
+            for method, path, body in calls
+            if method == "POST" and path == "issues/10/comments"
+        )
+        self.assertIn(
+            f"/verify io.github.example.test@1.2.3 sha256:{sha256}",
+            prompt,
         )
 
     def test_yank_keeps_history_and_revokes_review(self):
@@ -237,7 +289,13 @@ Known unsafe behavior.
             self.assertEqual(release["yankReason"], "Known unsafe behavior.")
             self.assertFalse(review_path.exists())
             self.assertEqual(
-                json.loads((root / "plugins.json").read_text(encoding="utf-8")), []
+                json.loads((root / "plugins.json").read_text(encoding="utf-8")),
+                [
+                    {
+                        "id": "dev.example.test",
+                        "repositoryUrl": "https://github.com/example/test",
+                    }
+                ],
             )
 
     def test_add_approval_is_idempotent_when_exact_request_is_already_central(self):

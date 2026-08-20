@@ -10,5 +10,6 @@ reviews/<plugin-id>/<strict-semver>.json
 `status: verified`、`reviewedBy`、`reviewedAt`、`sha256` 与可选说明；作者无法通过自己的
 `_manifest.json` 写入绿色审核标志。
 
-审核前至少应核对源仓库、依赖、能力声明、构建来源和最终 ZIP 哈希。撤销审核时删除记录；
+审核前至少应核对源仓库、依赖、能力声明、构建来源和最终 ZIP 哈希。撤销审核时记录会改为
+`status: revoked`，作为防止旧命令乱序恢复绿标的持久顺序标记；公开索引不会输出该记录。
 如版本存在风险，还应将对应历史版本标记为 `yanked`。
