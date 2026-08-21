@@ -1,0 +1,18 @@
+{
+  "$schema": "../../schemas/catalog-plugin-v1.schema.json",
+  "schemaVersion": 1,
+  "id": "io.github.touristh.example-clock",
+  "name": "电子时钟示例",
+  "description": "显示当前电脑时间的电子钟组件，可切换 24/12 小时制并控制时区和秒的显示。",
+  "authors": [
+    "TouristH"
+  ],
+  "repositoryUrl": "https://github.com/TouristH/NyaLauncher.Clock",
+  "maintainers": [
+    "TouristH"
+  ],
+  "categories": [
+    "utilities"
+  ],
+  "license": "MIT"
+}
