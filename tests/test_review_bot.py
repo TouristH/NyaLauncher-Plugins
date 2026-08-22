@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,14 +34,22 @@ class ReviewBotTests(unittest.TestCase):
             review_bot, "fetch_issue_comments_since", return_value=[]
         )
         self.comments = self.comments_patch.start()
+        self.environment_patch = patch.dict(
+            os.environ, {"GITHUB_ACTIONS": ""}, clear=False
+        )
+        self.environment_patch.start()
         self.addCleanup(self.root_patch.stop)
         self.addCleanup(self.validator_root_patch.stop)
         self.addCleanup(self.comments_patch.stop)
+        self.addCleanup(self.environment_patch.stop)
         self.addCleanup(self.temporary.cleanup)
 
         write_json(
             self.root / "repository.json",
-            {"trustedReviewers": ["TouristH", "SecondAdmin"]},
+            {
+                "schemaVersion": 1,
+                "trustedReviewers": ["TouristH", "SecondAdmin"],
+            },
         )
         write_json(
             self.root / "plugins" / PLUGIN_ID / "plugin.json",
@@ -132,6 +141,33 @@ class ReviewBotTests(unittest.TestCase):
             },
             "sender": {"login": actor},
         }
+
+    def test_schema1_bootstrap_anchor_supplies_numeric_reviewer_identity(self) -> None:
+        write_json(
+            self.root / "repository.json",
+            {"schemaVersion": 1, "trustedReviewers": ["TouristH"]},
+        )
+        write_json(
+            self.root / "migrations" / "v2-bootstrap.json",
+            {"trustedReviewerIds": {"TouristH": 143396778}},
+        )
+        command, actor = review_bot.authorize_event(self.event())
+        self.assertEqual(command.action, "verify")
+        self.assertEqual(actor, "TouristH")
+        mismatched = self.event()
+        mismatched["comment"]["user"]["id"] += 1
+        with self.assertRaises(review_bot.ReviewPermissionFailure):
+            review_bot.authorize_event(mismatched)
+
+    def test_reviewer_identity_config_rejects_malformed_schema_version(self) -> None:
+        for schema_version in (None, "1", True, 3):
+            with self.subTest(schema_version=schema_version):
+                value = {"trustedReviewers": ["TouristH"]}
+                if schema_version is not None:
+                    value["schemaVersion"] = schema_version
+                write_json(self.root / "repository.json", value)
+                with self.assertRaises(review_bot.ReviewFailure):
+                    review_bot.trusted_reviewer_ids()
 
     def apply_verified(self, event: dict | None = None) -> review_bot.ApplyResult:
         with (
@@ -390,6 +426,7 @@ class ReviewBotTests(unittest.TestCase):
         write_json(
             self.root / "repository.json",
             {
+                "schemaVersion": 1,
                 "trustedReviewers": ["TouristH", "SecondAdmin"],
                 "trustedReviewerIds": {
                     "TouristH": 143396778,

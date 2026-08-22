@@ -29,7 +29,9 @@ py -3 -m unittest discover -s tests -v
    lineage，并固定 v1/目标 reviewer numeric 映射。PR1 不得修改 `repository.json`、`plugins.json`、
    `plugin_details.json`、任何已有插件/review 数据或 `public/**` 生成文件。
 3. PR1 合并后不要重新启用写工作流。新 policy 会冻结 schema1 下所有 App 数据 PR，workflow 自身也
-   在调用机器人前要求 `schemaVersion == 2`；锚点一旦进入 base，任何账号或 App 都不能修改/删除。
+   在调用机器人前要求 `schemaVersion == 2`；Refresh 的只读 gate 在精确 schema1 时绿色跳过写 job，
+   但缺字段、错误类型、未知版本或损坏 JSON 会红灯失败。锚点一旦进入 base，任何账号或 App 都不能
+   修改/删除。
 4. **PR2（唯一数据迁移）**从最新 PR1 main 创建，只做确定性 v1→v2 数据迁移：更新
    `repository.json`/active 指针，按锚点新增 g1 identity，仅给既有 release/review 补 generation 与
    reviewer numeric ID，并重建生成视图。不得增删版本或改变 URL、哈希、大小等发布事实。

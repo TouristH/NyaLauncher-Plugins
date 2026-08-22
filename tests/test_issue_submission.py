@@ -13,6 +13,48 @@ def write_json(path: Path, value: object) -> None:
 
 
 class IssueSubmissionTests(unittest.TestCase):
+    def test_schema1_bootstrap_anchor_enforces_numeric_reviewer_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "repository.json",
+                {"schemaVersion": 1, "trustedReviewers": ["TouristH"]},
+            )
+            write_json(
+                root / "migrations" / "v2-bootstrap.json",
+                {"trustedReviewerIds": {"TouristH": 143396778}},
+            )
+            event = {
+                "comment": {
+                    "body": "/approve",
+                    "user": {
+                        "login": "TouristH",
+                        "id": 143396778,
+                        "type": "User",
+                    },
+                }
+            }
+            with patch.object(submission, "ROOT", root):
+                self.assertEqual(submission.trusted_event_actor(event), "TouristH")
+                event["comment"]["user"]["id"] += 1
+                with self.assertRaises(submission.PermissionFailure):
+                    submission.trusted_event_actor(event)
+
+    def test_reviewer_identity_config_rejects_malformed_schema_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for schema_version in (None, "1", True, 3):
+                with self.subTest(schema_version=schema_version):
+                    value = {"trustedReviewers": ["TouristH"]}
+                    if schema_version is not None:
+                        value["schemaVersion"] = schema_version
+                    write_json(root / "repository.json", value)
+                    with (
+                        patch.object(submission, "ROOT", root),
+                        self.assertRaises(submission.SubmissionFailure),
+                    ):
+                        submission.trusted_reviewer_ids()
+
     def test_parse_issue_form_sections(self):
         body = """
 ### 插件 ID / Plugin ID
@@ -282,7 +324,10 @@ dev.example.test
     def test_yank_keeps_history_and_revokes_review(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_json(root / "repository.json", {"trustedReviewers": ["TouristH"]})
+            write_json(
+                root / "repository.json",
+                {"schemaVersion": 1, "trustedReviewers": ["TouristH"]},
+            )
             write_json(
                 root / "plugins.json",
                 [
@@ -313,7 +358,14 @@ dev.example.test
 Known unsafe behavior.
 """,
                 },
-                "comment": {"body": "/approve", "user": {"login": "TouristH"}},
+                "comment": {
+                    "body": "/approve",
+                    "user": {
+                        "login": "TouristH",
+                        "id": 143396778,
+                        "type": "User",
+                    },
+                },
             }
             with patch.object(submission, "ROOT", root):
                 submission.apply_request(event, "TouristH")
@@ -411,11 +463,23 @@ io.github.example.test
 https://github.com/example/test
 """,
                 },
-                "comment": {"body": "/approve", "user": {"login": "TouristH"}},
+                "comment": {
+                    "body": "/approve",
+                    "user": {
+                        "login": "TouristH",
+                        "id": 143396778,
+                        "type": "User",
+                    },
+                },
             }
             with (
                 patch.object(submission, "ROOT", root),
                 patch.object(submission, "trusted_reviewers", return_value={"touristh"}),
+                patch.object(
+                    submission,
+                    "trusted_reviewer_ids",
+                    return_value={"touristh": 143396778},
+                ),
                 patch.object(submission.validator, "load_plugin_list", return_value=[]),
                 patch.object(submission.validator, "load_catalog", return_value=[]),
                 patch.object(
@@ -724,7 +788,10 @@ Known unsafe release.
     def test_partial_yank_keeps_active_listing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_json(root / "repository.json", {"trustedReviewers": ["TouristH"]})
+            write_json(
+                root / "repository.json",
+                {"schemaVersion": 1, "trustedReviewers": ["TouristH"]},
+            )
             listing = {
                 "id": "dev.example.test",
                 "repositoryUrl": "https://github.com/example/test",

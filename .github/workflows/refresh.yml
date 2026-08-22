@@ -10,7 +10,41 @@ permissions:
   issues: write
 
 jobs:
+  schema_gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - name: Checkout trusted registry main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Check staged registry schema
+        id: check
+        run: |
+          set -euo pipefail
+          STATE="$(jq -er '
+            if type != "object" then error("repository root must be an object")
+            elif (.schemaVersion | type) != "number" then error("schemaVersion must be numeric")
+            elif .schemaVersion == 2 then "ready"
+            elif .schemaVersion == 1 then "legacy"
+            else error("unsupported schemaVersion")
+            end
+          ' repository.json)"
+          if [ "$STATE" = "legacy" ]; then
+            echo "::notice::Registry schema v2 migration is not complete; discovery is safely skipped."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
   refresh:
+    needs: schema_gate
+    if: needs.schema_gate.outputs.ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
@@ -23,13 +57,6 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - name: Require completed schema v2 migration
-        run: |
-          set -euo pipefail
-          if ! jq -e '.schemaVersion == 2' repository.json >/dev/null; then
-            echo "Registry schema v2 migration is not complete; refusing all discovery and writes."
-            exit 78
-          fi
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

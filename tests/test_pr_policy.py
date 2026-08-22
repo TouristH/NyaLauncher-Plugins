@@ -203,10 +203,16 @@ class PullRequestPolicyTests(unittest.TestCase):
         self.assertIn("for LABEL in review-request pending-review", text)
         self.assertIn("-f state=closed", text)
         self.assertLess(
-            text.index("Require completed schema v2 migration"),
+            text.index("Check staged registry schema"),
             text.index("python tools/registry_bot.py collect"),
         )
-        self.assertIn(".schemaVersion == 2", text)
+        self.assertIn("  schema_gate:", text)
+        self.assertIn("needs: schema_gate", text)
+        self.assertIn("if: needs.schema_gate.outputs.ready == 'true'", text)
+        self.assertIn('elif .schemaVersion == 2 then "ready"', text)
+        self.assertIn('elif .schemaVersion == 1 then "legacy"', text)
+        self.assertIn('else error("unsupported schemaVersion")', text)
+        self.assertNotIn("exit 78", text)
 
     def test_name_status_parser_preserves_rename_paths(self):
         self.assertEqual(

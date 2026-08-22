@@ -90,10 +90,28 @@ class RegistryBotTests(unittest.TestCase):
             ),
         )
         self.identity.start()
+        self.schema = patch.object(
+            bot.validator, "repository_schema_version", return_value=2
+        )
+        self.schema.start()
 
     def tearDown(self):
+        self.schema.stop()
         self.identity.stop()
         self.environment.stop()
+
+    def test_schema1_collect_is_fail_closed_before_discovery_or_writes(self):
+        with (
+            patch.object(
+                bot.validator, "repository_schema_version", return_value=1
+            ),
+            patch.object(bot, "collect_issue_candidates") as issues,
+            patch.object(bot, "_write_generated_views") as write_views,
+        ):
+            result = bot.collect(write=True)
+        issues.assert_not_called()
+        write_views.assert_not_called()
+        self.assertIn("migration 尚未完成", result["warnings"][0])
 
     def test_issue_repository_identity_is_resolved_from_github_numeric_ids(self):
         candidate = bot.Candidate(

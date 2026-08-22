@@ -172,14 +172,45 @@ def trusted_reviewers() -> set[str]:
 def trusted_reviewer_ids() -> dict[str, int]:
     try:
         value = json.loads((ROOT / "repository.json").read_text(encoding="utf-8"))
-        reviewer_ids = value["trustedReviewerIds"]
-    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            raise ReviewFailure("无法读取 trustedReviewerIds") from exc
-        return {}
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise ReviewFailure("无法读取 repository.json") from exc
+    if not isinstance(value, dict):
+        raise ReviewFailure("repository.json 配置无效")
+    schema_version = value.get("schemaVersion")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise ReviewFailure("repository.json schemaVersion 必须精确为整数 1 或 2")
+    reviewer_ids = value.get("trustedReviewerIds")
+    if reviewer_ids is None and schema_version == 1:
+        anchor_path = ROOT / "migrations" / "v2-bootstrap.json"
+        if not anchor_path.exists():
+            return {}
+        try:
+            anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            if not isinstance(anchor, dict):
+                raise TypeError("bootstrap root must be an object")
+            reviewer_ids = anchor["trustedReviewerIds"]
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ReviewFailure("无法读取 bootstrap trustedReviewerIds") from exc
     if not isinstance(reviewer_ids, dict):
         raise ReviewFailure("trustedReviewerIds 配置无效")
-    return {str(login).casefold(): reviewer_id for login, reviewer_id in reviewer_ids.items()}
+    result: dict[str, int] = {}
+    for login, reviewer_id in reviewer_ids.items():
+        if (
+            not isinstance(login, str)
+            or validator.GITHUB_LOGIN.fullmatch(login) is None
+            or type(reviewer_id) is not int
+            or not 1 <= reviewer_id <= 2**63 - 1
+            or login.casefold() in result
+        ):
+            raise ReviewFailure("trustedReviewerIds 配置无效")
+        result[login.casefold()] = reviewer_id
+    return result
+
+
+def numeric_reviewer_identity_required() -> bool:
+    return validator.repository_schema_version() >= 2 or bool(
+        trusted_reviewer_ids()
+    )
 
 
 def authorize_event(event: dict) -> tuple[ReviewCommand, str]:
@@ -198,10 +229,7 @@ def authorize_event(event: dict) -> tuple[ReviewCommand, str]:
     actor_id = user.get("id") if isinstance(user, dict) else None
     actor_type = user.get("type") if isinstance(user, dict) else None
     reviewer_ids = trusted_reviewer_ids()
-    requires_numeric_identity = (
-        validator.repository_schema_version() >= 2
-        or os.environ.get("GITHUB_ACTIONS") == "true"
-    )
+    requires_numeric_identity = numeric_reviewer_identity_required()
     if (
         not isinstance(actor, str)
         or validator.GITHUB_LOGIN.fullmatch(actor) is None
@@ -318,10 +346,7 @@ def reject_superseded_verify(
         return
     reviewers = trusted_reviewers()
     reviewer_ids = trusted_reviewer_ids()
-    requires_numeric_identity = (
-        validator.repository_schema_version() >= 2
-        or os.environ.get("GITHUB_ACTIONS") == "true"
-    )
+    requires_numeric_identity = numeric_reviewer_identity_required()
     for comment in fetch_issue_comments_since(event, current_position[0]):
         user = comment.get("user")
         actor = user.get("login") if isinstance(user, dict) else None
@@ -446,7 +471,7 @@ def review_source_value(
 def apply_review(event: dict) -> ApplyResult:
     command, actor = authorize_event(event)
     actor_id = trusted_reviewer_ids().get(actor.casefold())
-    if type(actor_id) is not int and validator.repository_schema_version() >= 2:
+    if type(actor_id) is not int and numeric_reviewer_identity_required():
         raise ReviewFailure("审核者缺少受保护数字身份")
     plugin, release = resolve_canonical_release(command)
     path = checked_review_path(command)

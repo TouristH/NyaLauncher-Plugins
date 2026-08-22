@@ -108,12 +108,39 @@ def trusted_reviewer_ids() -> dict[str, int]:
     path = ROOT / "repository.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        reviewer_ids = value["trustedReviewerIds"]
-    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise SubmissionFailure("无法读取 trustedReviewerIds") from exc
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise SubmissionFailure("无法读取 repository.json") from exc
+    if not isinstance(value, dict):
+        raise SubmissionFailure("repository.json 配置无效")
+    schema_version = value.get("schemaVersion")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise SubmissionFailure("repository.json schemaVersion 必须精确为整数 1 或 2")
+    reviewer_ids = value.get("trustedReviewerIds")
+    if reviewer_ids is None and schema_version == 1:
+        anchor_path = ROOT / "migrations" / "v2-bootstrap.json"
+        if not anchor_path.exists():
+            return {}
+        try:
+            anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            if not isinstance(anchor, dict):
+                raise TypeError("bootstrap root must be an object")
+            reviewer_ids = anchor["trustedReviewerIds"]
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise SubmissionFailure("无法读取 bootstrap trustedReviewerIds") from exc
     if not isinstance(reviewer_ids, dict):
         raise SubmissionFailure("trustedReviewerIds 配置无效")
-    return {str(login).casefold(): reviewer_id for login, reviewer_id in reviewer_ids.items()}
+    result: dict[str, int] = {}
+    for login, reviewer_id in reviewer_ids.items():
+        if (
+            not isinstance(login, str)
+            or validator.GITHUB_LOGIN.fullmatch(login) is None
+            or type(reviewer_id) is not int
+            or not 1 <= reviewer_id <= 2**63 - 1
+            or login.casefold() in result
+        ):
+            raise SubmissionFailure("trustedReviewerIds 配置无效")
+        result[login.casefold()] = reviewer_id
+    return result
 
 
 def repository_schema_version() -> int:
@@ -137,7 +164,8 @@ def trusted_event_actor(event: dict) -> str:
     actor = event_actor(event)
     if actor.casefold() not in trusted_reviewers():
         raise PermissionFailure("只有可信维护者可以执行该命令")
-    if repository_schema_version() < 2:
+    reviewer_ids = trusted_reviewer_ids()
+    if repository_schema_version() < 2 and not reviewer_ids:
         return actor
     comment = event.get("comment")
     user = comment.get("user") if isinstance(comment, dict) else None
@@ -145,7 +173,7 @@ def trusted_event_actor(event: dict) -> str:
     actor_type = user.get("type") if isinstance(user, dict) else None
     if (
         type(actor_id) is not int
-        or trusted_reviewer_ids().get(actor.casefold()) != actor_id
+        or reviewer_ids.get(actor.casefold()) != actor_id
         or actor_type != "User"
     ):
         raise PermissionFailure(
