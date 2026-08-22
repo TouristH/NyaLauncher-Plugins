@@ -1,3 +1,4 @@
+import copy
 import io
 import os
 import unittest
@@ -89,10 +90,28 @@ class RegistryBotTests(unittest.TestCase):
             ),
         )
         self.identity.start()
+        self.schema = patch.object(
+            bot.validator, "repository_schema_version", return_value=2
+        )
+        self.schema.start()
 
     def tearDown(self):
+        self.schema.stop()
         self.identity.stop()
         self.environment.stop()
+
+    def test_schema1_collect_is_fail_closed_before_discovery_or_writes(self):
+        with (
+            patch.object(
+                bot.validator, "repository_schema_version", return_value=1
+            ),
+            patch.object(bot, "collect_issue_candidates") as issues,
+            patch.object(bot, "_write_generated_views") as write_views,
+        ):
+            result = bot.collect(write=True)
+        issues.assert_not_called()
+        write_views.assert_not_called()
+        self.assertIn("migration 尚未完成", result["warnings"][0])
 
     def test_issue_repository_identity_is_resolved_from_github_numeric_ids(self):
         candidate = bot.Candidate(
@@ -488,6 +507,208 @@ class RegistryBotTests(unittest.TestCase):
         self.assertEqual(result["accepted"], [])
         self.assertIn("numeric identity", result["rejected"][0]["reason"])
 
+    def test_retired_numeric_publisher_is_reactivated_with_same_lineage(self):
+        plugin_id = "io.github.alice.tool"
+        repository_url = "https://github.com/alice/original"
+        renamed_url = "https://github.com/alice/renamed"
+        lineage_id = "33333333-3333-4333-8333-333333333333"
+        historical = plugin_snapshot(plugin_id, repository_url)
+        historical.update(
+            {
+                "lineageId": lineage_id,
+                "generation": 1,
+                "lifecycleStatus": "retired",
+                "visibility": "hidden",
+                "publisher": {"repositoryId": 1001, "ownerId": 101},
+                "generations": [
+                    {
+                        "generation": 1,
+                        "repositoryUrl": repository_url,
+                        "repositoryUrlHistory": [repository_url],
+                        "repositoryId": 1001,
+                        "ownerId": 101,
+                        "status": "retired",
+                    }
+                ],
+            }
+        )
+        historical["releases"][0].update({"generation": 1, "yanked": True})
+        refreshed = copy.deepcopy(historical)
+        refreshed["lifecycleStatus"] = "active"
+        refreshed["visibility"] = "listed"
+        refreshed["repositoryUrl"] = renamed_url
+        refreshed["generations"][0]["repositoryUrl"] = renamed_url
+        refreshed["generations"][0]["repositoryUrlHistory"].append(renamed_url)
+        refreshed["releases"].insert(
+            0,
+            {
+                "generation": 1,
+                "version": "1.1.0",
+                "yanked": False,
+                "download": {"size": 1, "sha256": "b" * 64},
+            },
+        )
+        proposed = []
+
+        def api_get(path):
+            if "/issues?" in path:
+                return [issue(8, plugin_id, renamed_url)]
+            return {"total_count": 0, "incomplete_results": False, "items": []}
+
+        def refresh(listings, _details, **_kwargs):
+            proposed.extend(copy.deepcopy(listings))
+            return [refreshed]
+
+        with (
+            patch.object(bot.validator, "load_plugin_list", return_value=[]),
+            patch.object(bot.validator, "load_catalog", return_value=[historical]),
+            patch.object(bot.validator, "build_details", return_value=[historical]),
+            patch.object(
+                bot.validator,
+                "fetch_repository_manifest",
+                return_value={"id": plugin_id},
+            ),
+            patch.object(bot.validator, "validate_publisher_manifest_releases"),
+            patch.object(bot.validator, "refresh_details", side_effect=refresh),
+        ):
+            result = bot.collect(write=False, api_get=api_get)
+
+        self.assertEqual([item["id"] for item in result["accepted"]], [plugin_id])
+        self.assertEqual(proposed[0]["lineageId"], lineage_id)
+        self.assertEqual(proposed[0]["generation"], 1)
+        self.assertEqual(proposed[0]["repositoryId"], 1001)
+        self.assertEqual(proposed[0]["ownerId"], 101)
+        self.assertEqual(proposed[0]["repositoryUrl"], renamed_url)
+
+    def test_active_numeric_repository_rename_is_collected_without_new_release(self):
+        plugin_id = "io.github.alice.tool"
+        old_url = "https://github.com/alice/original"
+        new_url = "https://github.com/alice/renamed"
+        lineage_id = "33333333-3333-4333-8333-333333333333"
+        active = {
+            "id": plugin_id,
+            "lineageId": lineage_id,
+            "generation": 1,
+            "repositoryUrl": old_url,
+            "repositoryId": 1001,
+            "ownerId": 101,
+        }
+        historical = plugin_snapshot(plugin_id, old_url)
+        historical.update(
+            {
+                "lineageId": lineage_id,
+                "generation": 1,
+                "lifecycleStatus": "active",
+                "visibility": "listed",
+                "publisher": {"repositoryId": 1001, "ownerId": 101},
+                "generations": [
+                    {
+                        "generation": 1,
+                        "repositoryUrl": old_url,
+                        "repositoryUrlHistory": [old_url],
+                        "repositoryId": 1001,
+                        "ownerId": 101,
+                        "status": "active",
+                    }
+                ],
+            }
+        )
+
+        def api_get(path):
+            if "/issues?" in path:
+                return [issue(8, plugin_id, new_url)]
+            return {"total_count": 0, "incomplete_results": False, "items": []}
+
+        def refresh(listings, _details, **_kwargs):
+            self.assertEqual(listings[0]["repositoryUrl"], new_url)
+            renamed = copy.deepcopy(historical)
+            renamed["repositoryUrl"] = new_url
+            renamed["generations"][0]["repositoryUrl"] = new_url
+            renamed["generations"][0]["repositoryUrlHistory"].append(new_url)
+            return [renamed]
+
+        with (
+            patch.object(bot.validator, "load_plugin_list", return_value=[active]),
+            patch.object(bot.validator, "load_catalog", return_value=[historical]),
+            patch.object(bot.validator, "build_details", return_value=[historical]),
+            patch.object(
+                bot.validator,
+                "fetch_repository_manifest",
+                return_value={"id": plugin_id},
+            ),
+            patch.object(bot.validator, "validate_publisher_manifest_releases"),
+            patch.object(bot.validator, "refresh_details", side_effect=refresh),
+        ):
+            result = bot.collect(write=False, api_get=api_get)
+
+        self.assertEqual([item["id"] for item in result["accepted"]], [plugin_id])
+
+    def test_active_numeric_repository_rename_with_new_release_is_collected(self):
+        plugin_id = "io.github.alice.tool"
+        old_url = "https://github.com/alice/original"
+        new_url = "https://github.com/alice/renamed"
+        active = {
+            "id": plugin_id,
+            "lineageId": "33333333-3333-4333-8333-333333333333",
+            "generation": 1,
+            "repositoryUrl": old_url,
+            "repositoryId": 1001,
+            "ownerId": 101,
+        }
+        historical = plugin_snapshot(plugin_id, old_url)
+        historical.update(
+            {
+                "lineageId": active["lineageId"],
+                "generation": 1,
+                "lifecycleStatus": "active",
+                "publisher": {"repositoryId": 1001, "ownerId": 101},
+                "generations": [
+                    {
+                        "generation": 1,
+                        "repositoryUrl": old_url,
+                        "repositoryUrlHistory": [old_url],
+                        "repositoryId": 1001,
+                        "ownerId": 101,
+                        "status": "active",
+                    }
+                ],
+            }
+        )
+        refreshed = copy.deepcopy(historical)
+        refreshed["repositoryUrl"] = new_url
+        refreshed["generations"][0]["repositoryUrl"] = new_url
+        refreshed["generations"][0]["repositoryUrlHistory"].append(new_url)
+        refreshed["releases"].insert(
+            0,
+            {
+                "generation": 1,
+                "version": "1.1.0",
+                "yanked": False,
+                "download": {"size": 1, "sha256": "b" * 64},
+            },
+        )
+
+        def api_get(path):
+            if "/issues?" in path:
+                return [issue(9, plugin_id, new_url)]
+            return {"total_count": 0, "incomplete_results": False, "items": []}
+
+        with (
+            patch.object(bot.validator, "load_plugin_list", return_value=[active]),
+            patch.object(bot.validator, "load_catalog", return_value=[historical]),
+            patch.object(bot.validator, "build_details", return_value=[historical]),
+            patch.object(
+                bot.validator,
+                "fetch_repository_manifest",
+                return_value={"id": plugin_id},
+            ),
+            patch.object(bot.validator, "validate_publisher_manifest_releases"),
+            patch.object(bot.validator, "refresh_details", return_value=[refreshed]),
+        ):
+            result = bot.collect(write=False, api_get=api_get)
+
+        self.assertEqual([item["id"] for item in result["accepted"]], [plugin_id])
+
     def test_failed_candidates_consume_the_attempt_budget(self):
         issues = [
             issue(
@@ -830,16 +1051,17 @@ class RegistryBotTests(unittest.TestCase):
         ):
             result = bot.collect(write=True, api_get=api_get)
 
-        write_views.assert_called_once_with(
-            [
-                {
-                    "id": valid_id,
-                    "repositoryUrl": valid_url,
-                    "repositoryId": 1001,
-                    "ownerId": 101,
-                }
-            ]
+        write_views.assert_called_once()
+        listing = write_views.call_args.args[0][0]
+        self.assertEqual(listing["id"], valid_id)
+        self.assertEqual(listing["generation"], 1)
+        self.assertRegex(
+            listing["lineageId"],
+            r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$",
         )
+        self.assertEqual(listing["repositoryUrl"], valid_url)
+        self.assertEqual(listing["repositoryId"], 1001)
+        self.assertEqual(listing["ownerId"], 101)
         self.assertEqual([item["id"] for item in result["accepted"]], [valid_id])
         failed = next(item for item in result["rejected"] if item["id"] == failed_id)
         self.assertIn("ZIP 校验失败", failed["reason"])

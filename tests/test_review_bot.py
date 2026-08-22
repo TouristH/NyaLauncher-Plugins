@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,14 +34,22 @@ class ReviewBotTests(unittest.TestCase):
             review_bot, "fetch_issue_comments_since", return_value=[]
         )
         self.comments = self.comments_patch.start()
+        self.environment_patch = patch.dict(
+            os.environ, {"GITHUB_ACTIONS": ""}, clear=False
+        )
+        self.environment_patch.start()
         self.addCleanup(self.root_patch.stop)
         self.addCleanup(self.validator_root_patch.stop)
         self.addCleanup(self.comments_patch.stop)
+        self.addCleanup(self.environment_patch.stop)
         self.addCleanup(self.temporary.cleanup)
 
         write_json(
             self.root / "repository.json",
-            {"trustedReviewers": ["TouristH", "SecondAdmin"]},
+            {
+                "schemaVersion": 1,
+                "trustedReviewers": ["TouristH", "SecondAdmin"],
+            },
         )
         write_json(
             self.root / "plugins" / PLUGIN_ID / "plugin.json",
@@ -106,6 +115,12 @@ class ReviewBotTests(unittest.TestCase):
         issue_body: str = "untrusted mutable body",
     ) -> dict:
         suffix = f" {note}" if note is not None else ""
+        actor_ids = {
+            "TouristH": 143396778,
+            "SecondAdmin": 200,
+            "FormerAdmin": 201,
+            "stranger": 202,
+        }
         return {
             "issue": {
                 "number": 42,
@@ -118,10 +133,41 @@ class ReviewBotTests(unittest.TestCase):
                     f"/{action} {PLUGIN_ID}@{VERSION} sha256:{sha256}{suffix}"
                 ),
                 "created_at": created_at,
-                "user": {"login": actor},
+                "user": {
+                    "login": actor,
+                    "id": actor_ids.get(actor, 203),
+                    "type": "User",
+                },
             },
             "sender": {"login": actor},
         }
+
+    def test_schema1_bootstrap_anchor_supplies_numeric_reviewer_identity(self) -> None:
+        write_json(
+            self.root / "repository.json",
+            {"schemaVersion": 1, "trustedReviewers": ["TouristH"]},
+        )
+        write_json(
+            self.root / "migrations" / "v2-bootstrap.json",
+            {"trustedReviewerIds": {"TouristH": 143396778}},
+        )
+        command, actor = review_bot.authorize_event(self.event())
+        self.assertEqual(command.action, "verify")
+        self.assertEqual(actor, "TouristH")
+        mismatched = self.event()
+        mismatched["comment"]["user"]["id"] += 1
+        with self.assertRaises(review_bot.ReviewPermissionFailure):
+            review_bot.authorize_event(mismatched)
+
+    def test_reviewer_identity_config_rejects_malformed_schema_version(self) -> None:
+        for schema_version in (None, "1", True, 3):
+            with self.subTest(schema_version=schema_version):
+                value = {"trustedReviewers": ["TouristH"]}
+                if schema_version is not None:
+                    value["schemaVersion"] = schema_version
+                write_json(self.root / "repository.json", value)
+                with self.assertRaises(review_bot.ReviewFailure):
+                    review_bot.trusted_reviewer_ids()
 
     def apply_verified(self, event: dict | None = None) -> review_bot.ApplyResult:
         with (
@@ -375,6 +421,37 @@ class ReviewBotTests(unittest.TestCase):
         self.comments.return_value = [later]
         result = self.apply_verified()
         self.assertTrue(result.changed)
+
+    def test_reused_or_offboarded_later_login_cannot_block_verification(self) -> None:
+        write_json(
+            self.root / "repository.json",
+            {
+                "schemaVersion": 1,
+                "trustedReviewers": ["TouristH", "SecondAdmin"],
+                "trustedReviewerIds": {
+                    "TouristH": 143396778,
+                    "SecondAdmin": 200,
+                },
+            },
+        )
+        with patch.dict(review_bot.os.environ, {"GITHUB_ACTIONS": "true"}):
+            for user in (
+                {"login": "TouristH", "id": 999, "type": "User"},
+                {"login": "TouristH", "id": 143396778, "type": "Bot"},
+                {"login": "FormerAdmin", "id": 201, "type": "User"},
+            ):
+                with self.subTest(user=user):
+                    later = self.event(
+                        action="revoke-review",
+                        created_at="2026-08-21T03:00:00Z",
+                        comment_id=300,
+                    )["comment"]
+                    later["user"] = user
+                    self.comments.return_value = [later]
+                    if self.review_path.exists():
+                        self.review_path.unlink()
+                    result = self.apply_verified()
+                    self.assertTrue(result.changed)
 
     def test_revoke_refuses_to_delete_a_mismatched_review_record(self) -> None:
         self.apply_verified()

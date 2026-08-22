@@ -10,6 +10,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,12 +104,82 @@ def trusted_reviewers() -> set[str]:
     return {item.casefold() for item in reviewers}
 
 
+def trusted_reviewer_ids() -> dict[str, int]:
+    path = ROOT / "repository.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise SubmissionFailure("无法读取 repository.json") from exc
+    if not isinstance(value, dict):
+        raise SubmissionFailure("repository.json 配置无效")
+    schema_version = value.get("schemaVersion")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise SubmissionFailure("repository.json schemaVersion 必须精确为整数 1 或 2")
+    reviewer_ids = value.get("trustedReviewerIds")
+    if reviewer_ids is None and schema_version == 1:
+        anchor_path = ROOT / "migrations" / "v2-bootstrap.json"
+        if not anchor_path.exists():
+            return {}
+        try:
+            anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            if not isinstance(anchor, dict):
+                raise TypeError("bootstrap root must be an object")
+            reviewer_ids = anchor["trustedReviewerIds"]
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise SubmissionFailure("无法读取 bootstrap trustedReviewerIds") from exc
+    if not isinstance(reviewer_ids, dict):
+        raise SubmissionFailure("trustedReviewerIds 配置无效")
+    result: dict[str, int] = {}
+    for login, reviewer_id in reviewer_ids.items():
+        if (
+            not isinstance(login, str)
+            or validator.GITHUB_LOGIN.fullmatch(login) is None
+            or type(reviewer_id) is not int
+            or not 1 <= reviewer_id <= 2**63 - 1
+            or login.casefold() in result
+        ):
+            raise SubmissionFailure("trustedReviewerIds 配置无效")
+        result[login.casefold()] = reviewer_id
+    return result
+
+
+def repository_schema_version() -> int:
+    try:
+        value = json.loads((ROOT / "repository.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return 1
+    version = value.get("schemaVersion") if isinstance(value, dict) else None
+    return version if type(version) is int else 1
+
+
 def event_actor(event: dict) -> str:
     source = event.get("comment") or event.get("sender") or {}
     actor = source.get("user", source).get("login") if isinstance(source, dict) else None
     if not isinstance(actor, str) or not actor.strip():
         raise SubmissionFailure("事件中没有有效操作账号")
     return actor.strip()
+
+
+def trusted_event_actor(event: dict) -> str:
+    actor = event_actor(event)
+    if actor.casefold() not in trusted_reviewers():
+        raise PermissionFailure("只有可信维护者可以执行该命令")
+    reviewer_ids = trusted_reviewer_ids()
+    if repository_schema_version() < 2 and not reviewer_ids:
+        return actor
+    comment = event.get("comment")
+    user = comment.get("user") if isinstance(comment, dict) else None
+    actor_id = user.get("id") if isinstance(user, dict) else None
+    actor_type = user.get("type") if isinstance(user, dict) else None
+    if (
+        type(actor_id) is not int
+        or reviewer_ids.get(actor.casefold()) != actor_id
+        or actor_type != "User"
+    ):
+        raise PermissionFailure(
+            "维护者登录名与 trustedReviewerIds 数字身份不一致"
+        )
+    return actor
 
 
 def check_trusted_command_permission(event: dict, command_name: str) -> None:
@@ -123,12 +194,9 @@ def check_trusted_command_permission(event: dict, command_name: str) -> None:
     if not command_matches:
         raise PermissionFailure(f"只接受精确的 /{command_name} 命令")
     try:
-        actor = event_actor(event)
-        reviewers = trusted_reviewers()
-    except SubmissionFailure as exc:
+        trusted_event_actor(event)
+    except (SubmissionFailure, PermissionFailure) as exc:
         raise PermissionFailure(str(exc)) from exc
-    if actor.casefold() not in reviewers:
-        raise PermissionFailure(f"只有可信维护者可以执行 /{command_name}")
 
 
 def check_validation_permission(event: dict) -> None:
@@ -222,21 +290,72 @@ def prepare_add_listing(event: dict) -> dict:
         for item in listings
     ):
         raise SubmissionFailure(f"仓库地址已收录：{listing['repositoryUrl']}")
+    catalog = validator.load_catalog()
     historical = next(
         (
             item
-            for item in validator.load_catalog()
+            for item in catalog
             if item["id"].casefold() == listing["id"].casefold()
         ),
         None,
     )
-    if historical is not None and not validator.same_github_repository(
-        historical["repositoryUrl"], listing["repositoryUrl"]
-    ):
-        raise SubmissionFailure(
-            f"插件 ID {listing['id']} 已有归档历史，不能转移到另一个发布仓库"
+    try:
+        repository_id, owner_id, repository_url = (
+            validator.fetch_github_repository_identity(
+                listing["repositoryUrl"], listing["id"]
+            )
         )
-    return listing
+    except validator.ValidationFailure as exc:
+        raise SubmissionFailure(str(exc)) from exc
+    numeric_owner = next(
+        (
+            item
+            for item in catalog
+            if item["id"].casefold() != listing["id"].casefold()
+            and any(
+                isinstance(binding, dict)
+                and binding.get("repositoryId") == repository_id
+                for binding in item.get("generations", [])
+            )
+        ),
+        None,
+    )
+    if numeric_owner is not None:
+        raise SubmissionFailure(
+            f"GitHub repositoryId {repository_id} 已永久绑定插件 "
+            f"{numeric_owner['id']}，不能改用其他 ID"
+        )
+    owner, _, _ = validator.github_repository_parts(
+        listing["id"], "repositoryUrl", repository_url
+    )
+    namespace_prefix = f"io.github.{owner.casefold()}."
+    if historical is None and not listing["id"].startswith(namespace_prefix):
+        raise SubmissionFailure(
+            f"首次收录 ID 必须以 {namespace_prefix} 开头"
+        )
+    if historical is not None:
+        publisher = historical.get("publisher", {})
+        if (
+            historical.get("lifecycleStatus") != "retired"
+            or publisher.get("repositoryId") != repository_id
+            or publisher.get("ownerId") != owner_id
+        ):
+            raise SubmissionFailure(
+                "归档插件只能由同一 repositoryId 与 ownerId 重新激活"
+            )
+        lineage_id = historical["lineageId"]
+        generation = historical["generation"]
+    else:
+        lineage_id = str(uuid.uuid4())
+        generation = 1
+    return {
+        "id": listing["id"],
+        "lineageId": lineage_id,
+        "generation": generation,
+        "repositoryUrl": repository_url,
+        "repositoryId": repository_id,
+        "ownerId": owner_id,
+    }
 
 
 def summarize_applied_add(event: dict) -> str:
@@ -247,30 +366,37 @@ def summarize_applied_add(event: dict) -> str:
 
 
 def validate_add(event: dict) -> tuple[str, dict, dict]:
-    listing = parse_add_listing(event)
+    listing = prepare_add_listing(event)
     plugin_id = listing["id"]
     repository_url = listing["repositoryUrl"]
-
-    listings = validator.load_plugin_list()
-    if any(item["id"].casefold() == plugin_id.casefold() for item in listings):
-        raise SubmissionFailure(f"插件 ID 已收录：{plugin_id}")
-    if any(item["repositoryUrl"].casefold() == repository_url.casefold() for item in listings):
-        raise SubmissionFailure(f"仓库地址已收录：{repository_url}")
 
     catalog = validator.load_catalog()
     historical = next(
         (item for item in catalog if item["id"].casefold() == plugin_id.casefold()),
         None,
     )
-    if historical is not None and not validator.same_github_repository(
-        historical["repositoryUrl"], repository_url
-    ):
-        raise SubmissionFailure(
-            f"插件 ID {plugin_id} 已有归档历史，不能转移到另一个发布仓库"
-        )
-
-    publisher = validator.fetch_publisher_manifest(listing)
-    plugin, releases = validator.validate_publisher_manifest_releases(publisher, listing)
+    validation_listing = dict(listing)
+    if historical is not None:
+        history = list(historical["generations"][-1]["repositoryUrlHistory"])
+        if repository_url != history[-1]:
+            if repository_url.casefold() in {item.casefold() for item in history}:
+                raise SubmissionFailure("仓库不能把 canonical URL 回滚到本代旧 alias")
+            history.append(repository_url)
+        validation_listing["repositoryUrlHistory"] = history
+    publisher = validator.fetch_publisher_manifest(validation_listing)
+    plugin, releases = validator.validate_publisher_manifest_releases(
+        publisher, validation_listing
+    )
+    plugin["generation"] = listing["generation"]
+    plugin["lineageId"] = listing["lineageId"]
+    plugin["publisher"] = {
+        "repositoryId": listing["repositoryId"],
+        "ownerId": listing["ownerId"],
+    }
+    if historical is not None:
+        plugin["repositoryUrlHistory"] = validation_listing["repositoryUrlHistory"]
+    for release in releases:
+        release["generation"] = listing["generation"]
     missing = validator.publisher_missing_releases(plugin, releases, historical)
     candidates = validator.plan_publisher_candidates(plugin, releases, historical)
     if historical is not None and not candidates:
@@ -303,11 +429,32 @@ def validate_add(event: dict) -> tuple[str, dict, dict]:
     return summary, listing, latest
 
 
-def parse_yank_request(event: dict) -> tuple[str, list[str], str]:
+def release_source_path(plugin_id: str, generation: int, version: str) -> Path:
+    root = ROOT / "plugins" / plugin_id
+    if generation > 1:
+        root = root / "generations" / f"g{generation}"
+    return root / "releases" / f"{version}.json"
+
+
+def review_source_path(plugin_id: str, generation: int, version: str) -> Path:
+    root = ROOT / "reviews" / plugin_id
+    if generation > 1:
+        root = root / f"g{generation}"
+    return root / f"{version}.json"
+
+
+def parse_yank_request(event: dict) -> tuple[str, int, list[str], str]:
     sections = parse_sections(str(event["issue"].get("body") or ""))
     plugin_id = field(sections, "插件 ID / Plugin ID")
     if len(plugin_id) > 128 or validator.PLUGIN_ID.fullmatch(plugin_id) is None:
         raise SubmissionFailure("插件 ID 必须是最长 128 字符的小写反向域名")
+    generation_text = sections.get("代际 / Generation", "1").strip() or "1"
+    try:
+        generation = int(generation_text, 10)
+    except ValueError as exc:
+        raise SubmissionFailure("generation 必须是正整数") from exc
+    if not 1 <= generation <= 2**31 - 1:
+        raise SubmissionFailure("generation 必须是正 Int32")
     versions_text = field(sections, "版本 / Versions")
     reason = field(sections, "撤回原因 / Reason")
     try:
@@ -316,7 +463,10 @@ def parse_yank_request(event: dict) -> tuple[str, list[str], str]:
         raise SubmissionFailure("撤回原因包含无效 Unicode") from exc
     if reason_length > 1024:
         raise SubmissionFailure("撤回原因不能超过 1024 个字符")
-    directory = ROOT / "plugins" / plugin_id / "releases"
+    directory = ROOT / "plugins" / plugin_id
+    if generation > 1:
+        directory = directory / "generations" / f"g{generation}"
+    directory = directory / "releases"
     if not directory.is_dir():
         raise SubmissionFailure(f"插件没有历史目录：{plugin_id}")
     available = {path.stem for path in directory.glob("*.json")}
@@ -332,13 +482,14 @@ def parse_yank_request(event: dict) -> tuple[str, list[str], str]:
     missing = sorted(set(versions) - available)
     if missing:
         raise SubmissionFailure(f"版本未收录：{', '.join(missing)}")
-    return plugin_id, versions, reason
+    return plugin_id, generation, versions, reason
 
 
 def validate_yank(event: dict) -> str:
-    plugin_id, versions, reason = parse_yank_request(event)
+    plugin_id, generation, versions, reason = parse_yank_request(event)
     return (
-        f"将撤回 `{plugin_id}` 的版本：{', '.join(f'`{item}`' for item in versions)}。\n\n"
+        f"将撤回 `{plugin_id}` generation `{generation}` 的版本："
+        f"{', '.join(f'`{item}`' for item in versions)}。\n\n"
         f"原因：{reason}\n\n历史文件将保留，但启动器不再允许选择这些版本。"
     )
 
@@ -361,8 +512,12 @@ def write_json(path: Path, value: object) -> None:
 
 
 def apply_request(event: dict, actor: str) -> str:
-    if actor.casefold() not in trusted_reviewers():
-        raise SubmissionFailure(f"{actor} 不在 trustedReviewers 中")
+    try:
+        verified_actor = trusted_event_actor(event)
+    except PermissionFailure as exc:
+        raise SubmissionFailure(str(exc)) from exc
+    if actor.casefold() != verified_actor.casefold():
+        raise SubmissionFailure("workflow actor 与评论数字身份不一致")
     comment = str((event.get("comment") or {}).get("body") or "").strip()
     if comment != "/approve":
         raise SubmissionFailure("只接受精确的 /approve 命令")
@@ -374,7 +529,11 @@ def apply_request(event: dict, actor: str) -> str:
             return already_applied
         listing = prepare_add_listing(event)
         listings = validator.load_plugin_list()
-        listings.append(listing)
+        listings.append(
+            listing
+            if repository_schema_version() >= 2
+            else {"id": listing["id"], "repositoryUrl": listing["repositoryUrl"]}
+        )
         listings.sort(key=lambda item: item["id"].casefold())
         write_json(ROOT / "plugins.json", listings)
         return (
@@ -382,10 +541,10 @@ def apply_request(event: dict, actor: str) -> str:
             "失败即中止的定向 Release ZIP 校验并据结果生成最终摘要。"
         )
 
-    plugin_id, versions, reason = parse_yank_request(event)
+    plugin_id, generation, versions, reason = parse_yank_request(event)
     releases: dict[str, tuple[Path, dict]] = {}
     for version in versions:
-        release_path = ROOT / "plugins" / plugin_id / "releases" / f"{version}.json"
+        release_path = release_source_path(plugin_id, generation, version)
         try:
             release = json.loads(release_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -403,9 +562,49 @@ def apply_request(event: dict, actor: str) -> str:
         release["yanked"] = True
         release["yankReason"] = reason
         write_json(release_path, release)
-        review_path = ROOT / "reviews" / plugin_id / f"{version}.json"
+        review_path = review_source_path(plugin_id, generation, version)
         if review_path.exists():
-            review_path.unlink()
+            try:
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise SubmissionFailure(
+                    f"无法读取审核墓碑：{plugin_id} g{generation}:{version}"
+                ) from exc
+            comment = event.get("comment") or {}
+            command_at = comment.get("created_at")
+            comment_id = comment.get("id")
+            if not isinstance(command_at, str) or type(comment_id) is not int:
+                if repository_schema_version() < 2:
+                    review_path.unlink()
+                    continue
+                raise SubmissionFailure("撤回已有审核版本时缺少可信评论时间或 ID")
+            if review.get("status") == "revoked":
+                # Revocation records are permanent audit facts.  Repeating an
+                # idempotent yank must not replace the original actor/time.
+                continue
+            if review.get("status") != "verified":
+                raise SubmissionFailure(
+                    f"审核墓碑状态无效：{plugin_id} g{generation}:{version}"
+                )
+            try:
+                validator.validate_utc_timestamp(
+                    "Yank comment", "created_at", command_at
+                )
+            except validator.ValidationFailure as exc:
+                raise SubmissionFailure(str(exc)) from exc
+            review.update(
+                {
+                    "generation": generation,
+                    "status": "revoked",
+                    "stateBy": actor,
+                    "stateById": trusted_reviewer_ids().get(actor.casefold()),
+                    "stateAt": command_at,
+                    "lastCommandAt": command_at,
+                    "lastCommentId": comment_id,
+                    "notes": f"版本撤回：{reason}",
+                }
+            )
+            write_json(review_path, review)
 
     # Keep the publisher pointer even when every current release is yanked.
     # Besides allowing a later fixed version to be discovered automatically,
@@ -507,11 +706,11 @@ def request_is_centrally_applied(event: dict) -> bool:
         )
 
     try:
-        plugin_id, versions, reason = parse_yank_request(event)
+        plugin_id, generation, versions, reason = parse_yank_request(event)
     except SubmissionFailure:
         return False
     for version in versions:
-        path = ROOT / "plugins" / plugin_id / "releases" / f"{version}.json"
+        path = release_source_path(plugin_id, generation, version)
         try:
             release = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -628,16 +827,23 @@ def initialize_issue(event: dict) -> None:
         publish_review_prompt(event)
 
 
-def canonical_review_target(event: dict) -> tuple[str, str, str]:
+def canonical_review_target(event: dict) -> tuple[str, int, str, str]:
     """Resolve an Issue's display target; apply-review never trusts this body."""
 
     sections = parse_sections(str(event["issue"].get("body") or ""))
     plugin_id = field(sections, "插件 ID / Plugin ID")
+    generation_text = sections.get("代际 / Generation", "1").strip() or "1"
     version = field(sections, "版本 / Version")
     if len(plugin_id) > 128 or validator.PLUGIN_ID.fullmatch(plugin_id) is None:
         raise SubmissionFailure("审核请求中的插件 ID 无效")
     if len(version) > 64 or validator.match_semver(version) is None:
         raise SubmissionFailure("审核请求中的版本必须是严格 SemVer")
+    try:
+        generation = int(generation_text, 10)
+    except ValueError as exc:
+        raise SubmissionFailure("审核请求中的 generation 必须是正整数") from exc
+    if not 1 <= generation <= 2**31 - 1:
+        raise SubmissionFailure("审核请求中的 generation 必须是正 Int32")
     plugin = next(
         (item for item in validator.load_catalog() if item["id"] == plugin_id),
         None,
@@ -645,14 +851,18 @@ def canonical_review_target(event: dict) -> tuple[str, str, str]:
     if plugin is None:
         raise SubmissionFailure(f"插件尚未收录：{plugin_id}")
     release = next(
-        (item for item in plugin["releases"] if item["version"] == version),
+        (
+            item
+            for item in plugin["releases"]
+            if item.get("generation", 1) == generation and item["version"] == version
+        ),
         None,
     )
     if release is None:
         raise SubmissionFailure(f"版本尚未收录：{plugin_id} {version}")
     if release["yanked"]:
         raise SubmissionFailure("已撤回版本不能申请绿色审核标志")
-    return plugin_id, version, release["download"]["sha256"]
+    return plugin_id, generation, version, release["download"]["sha256"]
 
 
 def publish_review_prompt(event: dict) -> None:
@@ -660,14 +870,15 @@ def publish_review_prompt(event: dict) -> None:
     if has_heading_comment(event, number, REVIEW_PROMPT_HEADING):
         return
     try:
-        plugin_id, version, sha256 = canonical_review_target(event)
+        plugin_id, generation, version, sha256 = canonical_review_target(event)
         body = (
             f"{REVIEW_PROMPT_HEADING}\n\n"
             "机器人已从中心不可变历史解析审核目标。管理员完成源码、依赖、能力与行为检查后，"
             "复制下面的完整命令：\n\n"
-            f"```text\n/verify {plugin_id}@{version} sha256:{sha256}\n```\n\n"
+            f"```text\n/verify {plugin_id}@g{generation}:{version} sha256:{sha256}\n```\n\n"
             "撤销已有审核标志时使用：\n\n"
-            f"```text\n/revoke-review {plugin_id}@{version} sha256:{sha256} 撤销原因\n```\n\n"
+            f"```text\n/revoke-review {plugin_id}@g{generation}:{version} "
+            f"sha256:{sha256} 撤销原因\n```\n\n"
             "最终操作只信任管理员评论中的完整 ID、版本和 SHA-256，不信任可编辑的 Issue 正文。"
         )
     except (SubmissionFailure, validator.ValidationFailure) as exc:
@@ -739,8 +950,12 @@ def publish_completion(event: dict, summary: str) -> None:
 
 
 def reject_request(event: dict, actor: str) -> None:
-    if actor.casefold() not in trusted_reviewers():
-        raise SubmissionFailure(f"{actor} 不在 trustedReviewers 中")
+    try:
+        verified_actor = trusted_event_actor(event)
+    except PermissionFailure as exc:
+        raise SubmissionFailure(str(exc)) from exc
+    if actor.casefold() != verified_actor.casefold():
+        raise SubmissionFailure("workflow actor 与评论数字身份不一致")
     command = str((event.get("comment") or {}).get("body") or "").strip()
     match = re.fullmatch(r"/reject(?:\s+([\s\S]+))?", command)
     if match is None:

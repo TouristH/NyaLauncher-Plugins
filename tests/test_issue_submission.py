@@ -13,6 +13,48 @@ def write_json(path: Path, value: object) -> None:
 
 
 class IssueSubmissionTests(unittest.TestCase):
+    def test_schema1_bootstrap_anchor_enforces_numeric_reviewer_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "repository.json",
+                {"schemaVersion": 1, "trustedReviewers": ["TouristH"]},
+            )
+            write_json(
+                root / "migrations" / "v2-bootstrap.json",
+                {"trustedReviewerIds": {"TouristH": 143396778}},
+            )
+            event = {
+                "comment": {
+                    "body": "/approve",
+                    "user": {
+                        "login": "TouristH",
+                        "id": 143396778,
+                        "type": "User",
+                    },
+                }
+            }
+            with patch.object(submission, "ROOT", root):
+                self.assertEqual(submission.trusted_event_actor(event), "TouristH")
+                event["comment"]["user"]["id"] += 1
+                with self.assertRaises(submission.PermissionFailure):
+                    submission.trusted_event_actor(event)
+
+    def test_reviewer_identity_config_rejects_malformed_schema_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for schema_version in (None, "1", True, 3):
+                with self.subTest(schema_version=schema_version):
+                    value = {"trustedReviewers": ["TouristH"]}
+                    if schema_version is not None:
+                        value["schemaVersion"] = schema_version
+                    write_json(root / "repository.json", value)
+                    with (
+                        patch.object(submission, "ROOT", root),
+                        self.assertRaises(submission.SubmissionFailure),
+                    ):
+                        submission.trusted_reviewer_ids()
+
     def test_parse_issue_form_sections(self):
         body = """
 ### 插件 ID / Plugin ID
@@ -75,37 +117,73 @@ dev.example.test
     def test_heavy_validation_requires_exact_command_from_trusted_reviewer(self):
         event = {
             "issue": {"user": {"login": "author"}},
-            "comment": {"body": "/validate", "user": {"login": "stranger"}},
+            "comment": {
+                "body": "/validate",
+                "user": {"login": "stranger", "id": 1, "type": "User"},
+            },
         }
-        with patch.object(submission, "trusted_reviewers", return_value={"touristh"}):
+        with (
+            patch.object(submission, "trusted_reviewers", return_value={"touristh"}),
+            patch.object(
+                submission,
+                "trusted_reviewer_ids",
+                return_value={"touristh": 143396778},
+            ),
+        ):
             with self.assertRaises(submission.SubmissionFailure):
                 submission.check_validation_permission(event)
             event["comment"]["user"]["login"] = "author"
             with self.assertRaises(submission.SubmissionFailure):
                 submission.check_validation_permission(event)
             event["comment"]["user"]["login"] = "TouristH"
+            event["comment"]["user"]["id"] = 143396778
             submission.check_validation_permission(event)
 
     def test_approve_preflight_requires_exact_command_from_trusted_reviewer(self):
         event = {
             "issue": {"title": "[Plugin] dev.example.test"},
-            "comment": {"body": "/approve", "user": {"login": "stranger"}},
+            "comment": {
+                "body": "/approve",
+                "user": {"login": "stranger", "id": 1, "type": "User"},
+            },
         }
-        with patch.object(submission, "trusted_reviewers", return_value={"touristh"}):
+        with (
+            patch.object(submission, "trusted_reviewers", return_value={"touristh"}),
+            patch.object(
+                submission,
+                "trusted_reviewer_ids",
+                return_value={"touristh": 143396778},
+            ),
+        ):
             with self.assertRaises(submission.PermissionFailure):
                 submission.check_trusted_command_permission(event, "approve")
             event["comment"]["user"]["login"] = "TouristH"
+            event["comment"]["user"]["id"] = 143396778
             submission.check_trusted_command_permission(event, "approve")
+            event["comment"]["user"]["id"] += 1
+            with self.assertRaises(submission.PermissionFailure):
+                submission.check_trusted_command_permission(event, "approve")
 
     def test_reject_preflight_accepts_reason_but_not_command_prefix(self):
         event = {
             "issue": {"title": "[Plugin] dev.example.test"},
             "comment": {
                 "body": "/reject 缺少必要的兼容性说明",
-                "user": {"login": "TouristH"},
+                "user": {
+                    "login": "TouristH",
+                    "id": 143396778,
+                    "type": "User",
+                },
             },
         }
-        with patch.object(submission, "trusted_reviewers", return_value={"touristh"}):
+        with (
+            patch.object(submission, "trusted_reviewers", return_value={"touristh"}),
+            patch.object(
+                submission,
+                "trusted_reviewer_ids",
+                return_value={"touristh": 143396778},
+            ),
+        ):
             submission.check_trusted_command_permission(event, "reject")
             event["comment"]["body"] = "/rejectevil"
             with self.assertRaises(submission.PermissionFailure):
@@ -239,14 +317,17 @@ dev.example.test
             if method == "POST" and path == "issues/10/comments"
         )
         self.assertIn(
-            f"/verify io.github.example.test@1.2.3 sha256:{sha256}",
+            f"/verify io.github.example.test@g1:1.2.3 sha256:{sha256}",
             prompt,
         )
 
     def test_yank_keeps_history_and_revokes_review(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_json(root / "repository.json", {"trustedReviewers": ["TouristH"]})
+            write_json(
+                root / "repository.json",
+                {"schemaVersion": 1, "trustedReviewers": ["TouristH"]},
+            )
             write_json(
                 root / "plugins.json",
                 [
@@ -277,7 +358,14 @@ dev.example.test
 Known unsafe behavior.
 """,
                 },
-                "comment": {"body": "/approve", "user": {"login": "TouristH"}},
+                "comment": {
+                    "body": "/approve",
+                    "user": {
+                        "login": "TouristH",
+                        "id": 143396778,
+                        "type": "User",
+                    },
+                },
             }
             with patch.object(submission, "ROOT", root):
                 submission.apply_request(event, "TouristH")
@@ -312,7 +400,14 @@ dev.example.test
 https://github.com/example/test/
 """,
             },
-            "comment": {"body": "/approve", "user": {"login": "TouristH"}},
+            "comment": {
+                "body": "/approve",
+                "user": {
+                    "login": "TouristH",
+                    "id": 143396778,
+                    "type": "User",
+                },
+            },
         }
         listing = {
             "id": "dev.example.test",
@@ -333,6 +428,11 @@ https://github.com/example/test/
         with (
             patch.object(submission, "trusted_reviewers", return_value={"touristh"}),
             patch.object(
+                submission,
+                "trusted_reviewer_ids",
+                return_value={"touristh": 143396778},
+            ),
+            patch.object(
                 submission.validator, "load_plugin_list", return_value=[listing]
             ),
             patch.object(
@@ -352,24 +452,45 @@ https://github.com/example/test/
             write_json(root / "plugins.json", [])
             event = {
                 "issue": {
-                    "title": "[Plugin] dev.example.test",
+                    "title": "[Plugin] io.github.example.test",
                     "body": """
 ### 插件 ID / Plugin ID
 
-dev.example.test
+io.github.example.test
 
 ### 仓库地址 / Repository URL
 
 https://github.com/example/test
 """,
                 },
-                "comment": {"body": "/approve", "user": {"login": "TouristH"}},
+                "comment": {
+                    "body": "/approve",
+                    "user": {
+                        "login": "TouristH",
+                        "id": 143396778,
+                        "type": "User",
+                    },
+                },
             }
             with (
                 patch.object(submission, "ROOT", root),
                 patch.object(submission, "trusted_reviewers", return_value={"touristh"}),
+                patch.object(
+                    submission,
+                    "trusted_reviewer_ids",
+                    return_value={"touristh": 143396778},
+                ),
                 patch.object(submission.validator, "load_plugin_list", return_value=[]),
                 patch.object(submission.validator, "load_catalog", return_value=[]),
+                patch.object(
+                    submission.validator,
+                    "fetch_github_repository_identity",
+                    return_value=(
+                        1001,
+                        101,
+                        "https://github.com/example/test",
+                    ),
+                ),
                 patch.object(submission.validator, "fetch_publisher_manifest") as fetch,
                 patch.object(submission.validator, "download_release_asset") as download,
             ):
@@ -382,7 +503,7 @@ https://github.com/example/test
                 json.loads((root / "plugins.json").read_text(encoding="utf-8")),
                 [
                     {
-                        "id": "dev.example.test",
+                        "id": "io.github.example.test",
                         "repositoryUrl": "https://github.com/example/test",
                     }
                 ],
@@ -577,11 +698,11 @@ Second request.
         event = {
             "issue": {
                 "number": 7,
-                "title": "[Plugin] dev.example.test",
+                "title": "[Plugin] io.github.example.test",
                 "body": """
 ### 插件 ID / Plugin ID
 
-dev.example.test
+io.github.example.test
 
 ### 仓库地址 / Repository URL
 
@@ -590,7 +711,7 @@ https://github.com/example/test
             }
         }
         listing = {
-            "id": "dev.example.test",
+            "id": "io.github.example.test",
             "repositoryUrl": "https://github.com/example/test",
         }
         central = {
@@ -667,7 +788,10 @@ Known unsafe release.
     def test_partial_yank_keeps_active_listing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_json(root / "repository.json", {"trustedReviewers": ["TouristH"]})
+            write_json(
+                root / "repository.json",
+                {"schemaVersion": 1, "trustedReviewers": ["TouristH"]},
+            )
             listing = {
                 "id": "dev.example.test",
                 "repositoryUrl": "https://github.com/example/test",
@@ -764,11 +888,11 @@ https://github.com/example/test/
     def test_first_add_validates_latest_bounded_batch_and_reports_backfill(self):
         event = {
             "issue": {
-                "title": "[Plugin] dev.example.test",
+                "title": "[Plugin] io.github.example.test",
                 "body": """
 ### 插件 ID / Plugin ID
 
-dev.example.test
+io.github.example.test
 
 ### 仓库地址 / Repository URL
 
@@ -777,7 +901,7 @@ https://github.com/example/test
             }
         }
         plugin = {
-            "id": "dev.example.test",
+            "id": "io.github.example.test",
             "name": "Test",
             "repositoryUrl": "https://github.com/example/test",
         }
@@ -792,6 +916,15 @@ https://github.com/example/test
         with (
             patch.object(submission.validator, "load_plugin_list", return_value=[]),
             patch.object(submission.validator, "load_catalog", return_value=[]),
+            patch.object(
+                submission.validator,
+                "fetch_github_repository_identity",
+                return_value=(
+                    1001,
+                    101,
+                    "https://github.com/example/test",
+                ),
+            ),
             patch.object(
                 submission.validator,
                 "fetch_publisher_manifest",
@@ -824,6 +957,42 @@ https://github.com/example/test
         self.assertEqual(latest["version"], "1.2.0")
         self.assertIn("仍有 `1` 个较早版本", summary)
 
+    def test_first_add_requires_the_canonical_owner_namespace(self):
+        event = {
+            "issue": {
+                "title": "[Plugin] dev.example.test",
+                "body": """
+### 插件 ID / Plugin ID
+
+dev.example.test
+
+### 仓库地址 / Repository URL
+
+https://github.com/example/test
+""",
+            }
+        }
+        with (
+            patch.object(submission.validator, "load_plugin_list", return_value=[]),
+            patch.object(submission.validator, "load_catalog", return_value=[]),
+            patch.object(
+                submission.validator,
+                "fetch_github_repository_identity",
+                return_value=(
+                    1001,
+                    101,
+                    "https://github.com/example/test",
+                ),
+            ),
+            patch.object(submission.validator, "fetch_publisher_manifest") as fetch,
+            self.assertRaisesRegex(
+                submission.SubmissionFailure,
+                "必须以 io.github.example. 开头",
+            ),
+        ):
+            submission.validate_add(event)
+        fetch.assert_not_called()
+
     def test_archived_plugin_id_cannot_be_hijacked_or_reactivated_without_new_version(self):
         event_template = """
 ### 插件 ID / Plugin ID
@@ -836,7 +1005,23 @@ dev.example.test
 """
         historical = {
             "id": "dev.example.test",
+            "lineageId": "11111111-1111-4111-8111-111111111111",
+            "generation": 1,
+            "lifecycleStatus": "retired",
             "repositoryUrl": "https://github.com/original/test",
+            "publisher": {"repositoryId": 1001, "ownerId": 101},
+            "generations": [
+                {
+                    "generation": 1,
+                    "repositoryUrl": "https://github.com/original/test",
+                    "repositoryUrlHistory": [
+                        "https://github.com/original/test"
+                    ],
+                    "repositoryId": 1001,
+                    "ownerId": 101,
+                    "status": "retired",
+                }
+            ],
             "releases": [{"version": "2.0.0", "yanked": True}],
         }
         plugin = {
@@ -855,10 +1040,24 @@ dev.example.test
                     ),
                 }
             }
-            with patch.object(submission.validator, "fetch_publisher_manifest") as fetch:
-                with self.assertRaises(submission.SubmissionFailure):
-                    submission.validate_add(hijack)
-                fetch.assert_not_called()
+            with (
+                patch.object(
+                    submission.validator,
+                    "fetch_github_repository_identity",
+                    return_value=(
+                        2002,
+                        202,
+                        "https://github.com/attacker/test",
+                    ),
+                ),
+                patch.object(submission.validator, "fetch_publisher_manifest") as fetch,
+                self.assertRaisesRegex(
+                    submission.SubmissionFailure,
+                    "同一 repositoryId 与 ownerId",
+                ),
+            ):
+                submission.validate_add(hijack)
+            fetch.assert_not_called()
 
             stale = {
                 "issue": {
@@ -869,6 +1068,15 @@ dev.example.test
                 }
             }
             with (
+                patch.object(
+                    submission.validator,
+                    "fetch_github_repository_identity",
+                    return_value=(
+                        1001,
+                        101,
+                        "https://github.com/original/test",
+                    ),
+                ),
                 patch.object(
                     submission.validator,
                     "fetch_publisher_manifest",
@@ -886,10 +1094,66 @@ dev.example.test
                     submission.validator, "plan_publisher_candidates", return_value=[]
                 ),
                 patch.object(submission.validator, "download_release_asset") as download,
+                self.assertRaisesRegex(
+                    submission.SubmissionFailure,
+                    "至少声明一个中心尚未收录的版本",
+                ),
             ):
-                with self.assertRaises(submission.SubmissionFailure):
-                    submission.validate_add(stale)
-                download.assert_not_called()
+                submission.validate_add(stale)
+            download.assert_not_called()
+
+    def test_archived_numeric_repository_cannot_publish_under_a_different_id(self):
+        event = {
+            "issue": {
+                "title": "[Plugin] dev.example.new",
+                "body": """
+### 插件 ID / Plugin ID
+
+dev.example.new
+
+### 仓库地址 / Repository URL
+
+https://github.com/original/test
+""",
+            }
+        }
+        historical = {
+            "id": "dev.example.old",
+            "generations": [
+                {
+                    "generation": 1,
+                    "repositoryUrl": "https://github.com/original/test",
+                    "repositoryUrlHistory": [
+                        "https://github.com/original/test"
+                    ],
+                    "repositoryId": 1001,
+                    "ownerId": 101,
+                    "status": "retired",
+                }
+            ],
+        }
+        with (
+            patch.object(submission.validator, "load_plugin_list", return_value=[]),
+            patch.object(submission.validator, "load_catalog", return_value=[historical]),
+            patch.object(
+                submission.validator,
+                "fetch_github_repository_identity",
+                return_value=(
+                    1001,
+                    101,
+                    "https://github.com/original/test",
+                ),
+            ),
+            patch.object(submission.validator, "fetch_publisher_manifest") as fetch,
+            patch.object(submission.validator, "download_release_asset") as download,
+            self.assertRaisesRegex(
+                submission.SubmissionFailure,
+                "repositoryId 1001 已永久绑定插件 dev.example.old",
+            ),
+        ):
+            submission.validate_add(event)
+        fetch.assert_not_called()
+        download.assert_not_called()
 
     def test_archived_plugin_cannot_reactivate_with_only_a_lower_backfill(self):
         event = {
@@ -908,7 +1172,23 @@ https://github.com/original/test
         }
         historical = {
             "id": "dev.example.test",
+            "lineageId": "11111111-1111-4111-8111-111111111111",
+            "generation": 1,
+            "lifecycleStatus": "retired",
             "repositoryUrl": "https://github.com/original/test",
+            "publisher": {"repositoryId": 1001, "ownerId": 101},
+            "generations": [
+                {
+                    "generation": 1,
+                    "repositoryUrl": "https://github.com/original/test",
+                    "repositoryUrlHistory": [
+                        "https://github.com/original/test"
+                    ],
+                    "repositoryId": 1001,
+                    "ownerId": 101,
+                    "status": "retired",
+                }
+            ],
             "releases": [{"version": "2.0.0", "yanked": True}],
         }
         plugin = {
@@ -920,6 +1200,15 @@ https://github.com/original/test
         with (
             patch.object(submission.validator, "load_plugin_list", return_value=[]),
             patch.object(submission.validator, "load_catalog", return_value=[historical]),
+            patch.object(
+                submission.validator,
+                "fetch_github_repository_identity",
+                return_value=(
+                    1001,
+                    101,
+                    "https://github.com/original/test",
+                ),
+            ),
             patch.object(
                 submission.validator,
                 "fetch_publisher_manifest",
@@ -937,9 +1226,12 @@ https://github.com/original/test
                 submission.validator, "plan_publisher_candidates", return_value=[lower]
             ),
             patch.object(submission.validator, "download_release_asset") as download,
+            self.assertRaisesRegex(
+                submission.SubmissionFailure,
+                "高于历史最高版本 2.0.0",
+            ),
         ):
-            with self.assertRaises(submission.SubmissionFailure):
-                submission.validate_add(event)
+            submission.validate_add(event)
         download.assert_not_called()
 
     def test_yank_limits_reason_and_version_count(self):

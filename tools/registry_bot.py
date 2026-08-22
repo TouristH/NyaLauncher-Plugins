@@ -25,6 +25,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -397,7 +398,25 @@ def resolve_repository_identity(
 
 
 def _catalog_repository_map(catalog: list[dict]) -> dict[str, dict]:
-    return {plugin["repositoryUrl"].casefold(): plugin for plugin in catalog}
+    result: dict[str, dict] = {}
+    for plugin in catalog:
+        for binding in plugin.get("generations", []):
+            for repository_url in binding.get(
+                "repositoryUrlHistory", [binding.get("repositoryUrl")]
+            ):
+                if isinstance(repository_url, str):
+                    result[repository_url.casefold()] = plugin
+    return result
+
+
+def _catalog_repository_id_map(catalog: list[dict]) -> dict[int, dict]:
+    result: dict[int, dict] = {}
+    for plugin in catalog:
+        for binding in plugin.get("generations", []):
+            repository_id = binding.get("repositoryId")
+            if type(repository_id) is int:
+                result[repository_id] = plugin
+    return result
 
 
 def _rotate_candidates(candidates: list[Candidate]) -> list[Candidate]:
@@ -416,16 +435,30 @@ def _has_new_usable_history(before: dict | None, after: dict | None) -> bool:
     if after is None:
         return False
     before_versions = (
-        {release["version"] for release in before["releases"]}
+        {
+            (release.get("generation", 1), release["version"])
+            for release in before["releases"]
+        }
         if before is not None
         else set()
     )
     new_releases = [
         release
         for release in after["releases"]
-        if release["version"] not in before_versions
+        if (release.get("generation", 1), release["version"]) not in before_versions
     ]
     return bool(new_releases and any(not release["yanked"] for release in new_releases))
+
+
+def _has_verified_repository_rename(before: dict | None, after: dict | None) -> bool:
+    if before is None or after is None:
+        return False
+    return bool(
+        before.get("lineageId") == after.get("lineageId")
+        and before.get("generation") == after.get("generation")
+        and before.get("publisher") == after.get("publisher")
+        and before.get("repositoryUrl") != after.get("repositoryUrl")
+    )
 
 
 def _write_generated_views(listings: list[dict]) -> None:
@@ -435,6 +468,7 @@ def _write_generated_views(listings: list[dict]) -> None:
     )
     details = validator.build_details()
     index = validator.build_index(details)
+    index_v2 = validator.build_index_v2(details)
     validator.write_text_atomic(
         validator.ROOT / "plugin_details.json",
         validator.render(details),
@@ -442,6 +476,10 @@ def _write_generated_views(listings: list[dict]) -> None:
     validator.write_text_atomic(
         validator.ROOT / "public" / "v1" / "index.json",
         validator.render(index),
+    )
+    validator.write_text_atomic(
+        validator.ROOT / "public" / "v2" / "index.json",
+        validator.render(index_v2),
     )
 
 
@@ -455,6 +493,11 @@ def collect(*, write: bool, api_get: ApiGetter = github_get) -> dict:
         "reconciled": [],
         "warnings": [],
     }
+    if validator.repository_schema_version() < 2:
+        result["warnings"].append(
+            "identity-aware registry migration 尚未完成；本轮安全跳过所有发现与写入"
+        )
+        return result
     try:
         issue_candidates = collect_issue_candidates(api_get)
     except RegistryBotFailure as exc:
@@ -488,7 +531,7 @@ def collect(*, write: bool, api_get: ApiGetter = github_get) -> dict:
         if type(item.get("repositoryId")) is int
     }
     history_by_id = {item["id"].casefold(): item for item in catalog}
-    history_by_repository = _catalog_repository_map(catalog)
+    history_by_repository_id = _catalog_repository_id_map(catalog)
     seen_repositories: set[str] = set()
     prepared: list[tuple[Candidate, dict]] = []
     prepared_by_id: dict[str, tuple[Candidate, dict]] = {}
@@ -552,14 +595,19 @@ def collect(*, write: bool, api_get: ApiGetter = github_get) -> dict:
             )
             repository_key = repository_url.casefold()
             existing_numeric_repository = active_by_repository_id.get(repository_id)
+            renamed_active_repository = None
             if (
                 existing_numeric_repository is not None
                 and existing_numeric_repository["repositoryUrl"].casefold()
                 != repository_key
             ):
-                raise RegistryBotFailure(
-                    "GitHub repositoryId 已绑定其他中心路径，仓库改名或转移需人工迁移"
-                )
+                if existing_numeric_repository.get("ownerId") != owner_id:
+                    raise RegistryBotFailure(
+                        "检测到 GitHub 原生 ownership transfer（repositoryId 未变但 ownerId 已变）；"
+                        "注册表不接受同代静默换主。请先把仓库转回已绑定 owner，另建一个"
+                        "不同 repositoryId 的目标仓库，再执行管理员 lifecycle transfer"
+                    )
+                renamed_active_repository = existing_numeric_repository
             if repository_key in seen_repositories:
                 if candidate.source == "issue":
                     result["rejected"].append(
@@ -618,48 +666,125 @@ def collect(*, write: bool, api_get: ApiGetter = github_get) -> dict:
                 repository_id=repository_id,
                 owner_id=owner_id,
             )
-            if not manifest_id.startswith(_namespace_prefix(owner)):
+            id_key = manifest_id.casefold()
+            historical_id = history_by_id.get(id_key)
+            # Namespace ownership is a first-listing anti-squat rule.  A
+            # previously bound numeric repository/owner may have been renamed;
+            # its durable identity is checked below and must not be replaced by
+            # a mutable login/path prefix comparison.
+            if historical_id is None and not manifest_id.startswith(
+                _namespace_prefix(owner)
+            ):
                 raise RegistryBotFailure(
                     f"自动收录 ID 必须以 {_namespace_prefix(owner)} 开头"
                 )
             listing = {
                 "id": manifest_id,
+                "lineageId": str(uuid.uuid4()),
+                "generation": 1,
                 "repositoryUrl": repository_url,
                 "repositoryId": repository_id,
                 "ownerId": owner_id,
             }
+            historical_generations = (
+                historical_id.get("generations")
+                if historical_id is not None
+                else None
+            )
+            historical_binding = (
+                historical_generations[-1]
+                if isinstance(historical_generations, list)
+                and historical_generations
+                else None
+            )
+            same_historical_numeric_publisher = bool(
+                historical_binding is not None
+                and historical_binding.get("repositoryId") == repository_id
+                and historical_binding.get("ownerId") == owner_id
+            )
+            if renamed_active_repository is not None:
+                if (
+                    manifest_id.casefold()
+                    != renamed_active_repository["id"].casefold()
+                ):
+                    raise RegistryBotFailure(
+                        f"重命名仓库必须继续声明原插件 ID {renamed_active_repository['id']}"
+                    )
+                existing_history = history_by_id.get(manifest_id.casefold())
+                if existing_history is None:
+                    raise RegistryBotFailure("重命名 active 指针缺少中心身份历史")
+                listing["lineageId"] = existing_history["lineageId"]
+                listing["generation"] = existing_history["generation"]
+                current_binding = existing_history["generations"][-1]
+            elif same_historical_numeric_publisher:
+                listing["lineageId"] = historical_id["lineageId"]
+                listing["generation"] = historical_id["generation"]
+                current_binding = historical_binding
+            else:
+                current_binding = None
+            if current_binding is not None:
+                repository_history = list(
+                    current_binding.get(
+                        "repositoryUrlHistory", [current_binding["repositoryUrl"]]
+                    )
+                )
+                if repository_url != current_binding["repositoryUrl"]:
+                    if repository_url.casefold() in {
+                        item.casefold() for item in repository_history
+                    }:
+                        if repository_url.casefold() != current_binding[
+                            "repositoryUrl"
+                        ].casefold():
+                            raise RegistryBotFailure(
+                                "仓库不能把 canonical URL 回滚到本代旧 alias"
+                            )
+                        repository_url = current_binding["repositoryUrl"]
+                        listing["repositoryUrl"] = repository_url
+                    else:
+                        repository_history.append(repository_url)
+                validation_listing = {
+                    **listing,
+                    "repositoryUrlHistory": repository_history,
+                }
+            else:
+                validation_listing = listing
             try:
-                validator.validate_publisher_manifest_releases(manifest, listing)
+                validator.validate_publisher_manifest_releases(
+                    manifest, validation_listing
+                )
             except validator.ValidationFailure as exc:
                 raise RegistryBotFailure(str(exc)) from exc
 
-            id_key = manifest_id.casefold()
             existing_active_id = active_by_id.get(id_key)
-            if existing_active_id is not None:
+            if (
+                existing_active_id is not None
+                and renamed_active_repository is None
+            ):
                 raise RegistryBotFailure(
                     f"插件 ID 已由 {existing_active_id['repositoryUrl']} 收录"
                 )
-            historical_id = history_by_id.get(id_key)
             if historical_id is not None and id_key not in active_by_id:
-                raise RegistryBotFailure(
-                    "归档历史缺少 GitHub numeric identity 指针；必须由管理员核验并迁移后才能重新激活"
-                )
+                historical_publisher = historical_id.get("publisher", {})
+                if (
+                    historical_id.get("lifecycleStatus") != "retired"
+                    or historical_publisher.get("repositoryId") != repository_id
+                    or historical_publisher.get("ownerId") != owner_id
+                ):
+                    raise RegistryBotFailure(
+                        "归档 ID 只能由同一 repositoryId 与 ownerId 安全重新激活；"
+                        "旧记录缺少 GitHub numeric identity 时必须先由管理员迁移；"
+                        "转让必须使用不同 repositoryId 的目标仓库走管理员 lifecycle 流程；"
+                        "已做 GitHub 原生 ownership transfer 时请先转回原 owner"
+                    )
+                listing["lineageId"] = historical_id["lineageId"]
+                listing["generation"] = historical_id["generation"]
+            historical_numeric_repository = history_by_repository_id.get(repository_id)
             if (
-                historical_id is not None
-                and not validator.same_github_repository(
-                    historical_id["repositoryUrl"], repository_url
-                )
+                historical_numeric_repository is not None
+                and historical_numeric_repository["id"].casefold() != id_key
             ):
                 raise RegistryBotFailure(
-                    f"插件 ID 已有其他仓库历史：{historical_id['repositoryUrl']}"
-                )
-            historical_repository = history_by_repository.get(repository_key)
-            if (
-                historical_repository is not None
-                and historical_repository["id"].casefold() != id_key
-            ):
-                raise RegistryBotFailure(
-                    f"仓库已有其他插件历史：{historical_repository['id']}"
+                    f"数字仓库已有其他插件历史：{historical_numeric_repository['id']}"
                 )
             if id_key in conflicted_ids:
                 raise RegistryBotFailure("本轮发现多个不同仓库声明同一插件 ID，已全部拒绝")
@@ -710,7 +835,11 @@ def collect(*, write: bool, api_get: ApiGetter = github_get) -> dict:
             f"待验证新插件达到每轮上限 {MAXIMUM_NEW_PLUGINS}；其余候选延后"
         )
 
-    proposed_listings = [*active_listings, *(listing for _, listing in prepared)]
+    prepared_ids = {listing["id"].casefold() for _, listing in prepared}
+    proposed_listings = [
+        *(item for item in active_listings if item["id"].casefold() not in prepared_ids),
+        *(listing for _, listing in prepared),
+    ]
     proposed_listings.sort(key=lambda item: item["id"].casefold())
     refresh_warnings: list[str] = []
     retryable_refresh_failures: set[str] = set()
@@ -729,7 +858,12 @@ def collect(*, write: bool, api_get: ApiGetter = github_get) -> dict:
     accepted_listings: list[dict] = []
     for candidate, listing in prepared:
         key = listing["id"].casefold()
-        if _has_new_usable_history(before_by_id.get(key), after_by_id.get(key)):
+        if (
+            _has_new_usable_history(before_by_id.get(key), after_by_id.get(key))
+            or _has_verified_repository_rename(
+                before_by_id.get(key), after_by_id.get(key)
+            )
+        ):
             accepted_listings.append(listing)
             result["accepted"].append(
                 _result_item(candidate, id=listing["id"])
@@ -758,7 +892,11 @@ def collect(*, write: bool, api_get: ApiGetter = github_get) -> dict:
             result["deferred"].append(item)
 
     if write:
-        final_listings = [*active_listings, *accepted_listings]
+        accepted_ids = {item["id"].casefold() for item in accepted_listings}
+        final_listings = [
+            *(item for item in active_listings if item["id"].casefold() not in accepted_ids),
+            *accepted_listings,
+        ]
         final_listings.sort(key=lambda item: item["id"].casefold())
         _write_generated_views(final_listings)
     return result

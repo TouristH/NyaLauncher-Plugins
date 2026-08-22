@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/plugin-identity-v1.schema.json",
+  "title": "NyaLauncher durable plugin identity v1",
+  "description": "Permanent plugin lineage and immutable GitHub numeric publisher bindings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "lineageId",
+    "generation",
+    "lifecycleStatus",
+    "generations"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "id": { "$ref": "#/$defs/pluginId" },
+    "lineageId": { "$ref": "#/$defs/lineageId" },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "lifecycleStatus": { "enum": ["active", "retired", "transferred"] },
+    "generations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/generation" }
+    },
+    "events": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/event" }
+    }
+  },
+  "$defs": {
+    "pluginId": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:\\.[a-z0-9][a-z0-9-]*)+$"
+    },
+    "lineageId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "githubRepository": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/(?![A-Za-z0-9_.-]*\\.[gG][iI][tT]$)[A-Za-z0-9_.-]+$"
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generation", "repositoryUrl", "repositoryUrlHistory", "repositoryId", "ownerId", "status"],
+      "properties": {
+        "generation": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "repositoryUrl": { "$ref": "#/$defs/githubRepository" },
+        "repositoryUrlHistory": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/githubRepository" }
+        },
+        "repositoryId": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "ownerId": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "status": { "enum": ["active", "retired", "transferred"] }
+      }
+    },
+    "confirmation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "ownerId", "commentId"],
+          "properties": {
+            "kind": { "const": "owner-comment" },
+            "ownerId": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+            "commentId": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "sha256"],
+          "properties": {
+            "kind": { "const": "repository-file" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        }
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation", "generation", "sourceRepositoryId", "actor", "actorId",
+        "occurredAt", "issueNumber", "commentId", "reason", "authorConfirmation"
+      ],
+      "properties": {
+        "operation": { "enum": ["retire", "transfer"] },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "sourceRepositoryId": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "targetGeneration": { "type": "integer", "minimum": 2, "maximum": 2147483647 },
+        "targetRepositoryId": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "actor": { "$ref": "#/$defs/githubLogin" },
+        "actorId": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "occurredAt": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "issueNumber": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "commentId": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "authorConfirmation": { "$ref": "#/$defs/confirmation" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "transfer" } } },
+          "then": { "required": ["targetGeneration", "targetRepositoryId"] },
+          "else": {
+            "not": { "anyOf": [
+              { "required": ["targetGeneration"] },
+              { "required": ["targetRepositoryId"] }
+            ] }
+          }
+        }
+      ]
+    },
+    "githubLogin": {
+      "type": "string",
+      "maxLength": 39,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
+    }
+  }
+}

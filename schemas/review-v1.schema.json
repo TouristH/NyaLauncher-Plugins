@@ -7,10 +7,12 @@
   "required": [
     "schemaVersion",
     "pluginId",
+    "generation",
     "version",
     "sha256",
     "status",
     "stateBy",
+    "stateById",
     "stateAt",
     "lastCommandAt",
     "lastCommentId"
@@ -18,6 +20,7 @@
   "properties": {
     "$schema": { "type": "string" },
     "schemaVersion": { "type": "integer", "const": 1 },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
     "pluginId": {
       "type": "string",
       "maxLength": 128,
@@ -27,6 +30,11 @@
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "status": { "enum": ["verified", "revoked"] },
     "stateBy": { "$ref": "#/$defs/githubLogin" },
+    "stateById": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
     "stateAt": {
       "type": "string",
       "format": "date-time",

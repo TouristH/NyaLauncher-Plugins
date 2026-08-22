@@ -801,6 +801,424 @@ class PublisherRefreshTests(unittest.TestCase):
             details = validator.build_details()
             return validator.refresh_details(listings, details, write=write)
 
+    def upgrade_fixture_to_v2(self, fixture: RegistryFixture) -> dict:
+        lineage_id = "22222222-2222-4222-8222-222222222222"
+        repository = json.loads(
+            (fixture.root / "repository.json").read_text(encoding="utf-8")
+        )
+        repository.update(
+            {
+                "schemaVersion": 2,
+                "indexV2Path": "public/v2/index.json",
+                "v2MinimumLauncherVersion": "0.1.2-testplug.1",
+                "trustedReviewerIds": {"TouristH": 143396778},
+            }
+        )
+        write_json(fixture.root / "repository.json", repository)
+        listing = {
+            "id": fixture.plugin_id,
+            "lineageId": lineage_id,
+            "generation": 1,
+            "repositoryUrl": "https://github.com/example/test",
+            "repositoryId": 1001,
+            "ownerId": 101,
+        }
+        write_json(fixture.root / "plugins.json", [listing])
+        write_json(
+            fixture.root / "plugins" / fixture.plugin_id / "identity.json",
+            {
+                "schemaVersion": 1,
+                "id": fixture.plugin_id,
+                "lineageId": lineage_id,
+                "generation": 1,
+                "lifecycleStatus": "active",
+                "generations": [
+                    {
+                        "generation": 1,
+                        "repositoryUrl": listing["repositoryUrl"],
+                        "repositoryUrlHistory": [listing["repositoryUrl"]],
+                        "repositoryId": 1001,
+                        "ownerId": 101,
+                        "status": "active",
+                    }
+                ],
+            },
+        )
+        for path in (fixture.release_path, fixture.review_path):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["generation"] = 1
+            if path == fixture.review_path:
+                value["stateById"] = 143396778
+            write_json(path, value)
+        return listing
+
+    def test_same_numeric_repository_rename_without_release_persists_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            listing = self.upgrade_fixture_to_v2(fixture)
+            old_url = listing["repositoryUrl"]
+            new_url = "https://github.com/example/renamed"
+            renamed_listing = {**listing, "repositoryUrl": new_url}
+            publisher = copy.deepcopy(PUBLISHER_MANIFEST)
+            publisher["repository_url"] = new_url
+
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                patch.object(
+                    validator,
+                    "fetch_publisher_manifest",
+                    return_value=publisher,
+                ),
+                patch.object(validator, "verify_new_release_candidate") as verify,
+            ):
+                details = validator.refresh_details(
+                    [renamed_listing], validator.build_details(), write=True
+                )
+                # The collector commits the accepted active pointer together
+                # with refresh_details' durable metadata/history transaction.
+                write_json(fixture.root / "plugins.json", [renamed_listing])
+                index_v1 = validator.build_index(details)
+                index_v2 = validator.build_index_v2(details)
+
+            verify.assert_not_called()
+            plugin = json.loads(fixture.plugin_path.read_text(encoding="utf-8"))
+            identity = json.loads(
+                (
+                    fixture.root
+                    / "plugins"
+                    / fixture.plugin_id
+                    / "identity.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(plugin["repositoryUrl"], new_url)
+            self.assertEqual(
+                identity["generations"][0]["repositoryUrlHistory"],
+                [old_url, new_url],
+            )
+            self.assertEqual(index_v1["plugins"], [])
+            self.assertEqual(
+                index_v2["plugins"][0]["generations"][0][
+                    "repositoryUrlHistory"
+                ],
+                [old_url, new_url],
+            )
+
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                patch.object(
+                    validator,
+                    "fetch_publisher_manifest",
+                    return_value=publisher,
+                ),
+                self.assertRaisesRegex(ValidationFailure, "循环或重复"),
+            ):
+                validator.refresh_details(
+                    [listing], validator.build_details(), write=False
+                )
+
+    def test_same_numeric_repository_rename_with_new_release_persists_both(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            listing = self.upgrade_fixture_to_v2(fixture)
+            new_url = "https://github.com/example/renamed"
+            newer = publisher_with(publisher_release("1.1.0"))
+            newer["repository_url"] = new_url
+            newer_release = newer["releases"][-1]
+            newer_release["release_notes_url"] = newer_release[
+                "release_notes_url"
+            ].replace("https://github.com/example/test/", new_url + "/")
+            newer_release["download"]["url"] = newer_release["download"][
+                "url"
+            ].replace("https://github.com/example/test/", new_url + "/")
+
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                patch.object(
+                    validator,
+                    "fetch_publisher_manifest",
+                    return_value=newer,
+                ),
+                patch.object(validator, "verify_new_release_candidate") as verify,
+            ):
+                details = validator.refresh_details(
+                    [{**listing, "repositoryUrl": new_url}],
+                    validator.build_details(),
+                    write=True,
+                )
+
+            verify.assert_called_once()
+            self.assertEqual(
+                [release["version"] for release in details[0]["releases"]],
+                ["1.1.0", "1.0.0"],
+            )
+            identity = json.loads(
+                (
+                    fixture.root
+                    / "plugins"
+                    / fixture.plugin_id
+                    / "identity.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                identity["generations"][0]["repositoryUrlHistory"],
+                [listing["repositoryUrl"], new_url],
+            )
+
+    def test_case_only_repository_path_change_keeps_existing_canonical_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            listing = self.upgrade_fixture_to_v2(fixture)
+            publisher = copy.deepcopy(PUBLISHER_MANIFEST)
+            publisher["repository_url"] = "https://github.com/Example/Test"
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                patch.object(
+                    validator,
+                    "fetch_publisher_manifest",
+                    return_value=publisher,
+                ),
+            ):
+                result = validator.refresh_details(
+                    [
+                        {
+                            **listing,
+                            "repositoryUrl": "https://github.com/Example/Test",
+                        }
+                    ],
+                    validator.build_details(),
+                    write=True,
+                )
+            self.assertEqual(result[0]["repositoryUrl"], listing["repositoryUrl"])
+            identity = json.loads(
+                (
+                    fixture.root
+                    / "plugins"
+                    / fixture.plugin_id
+                    / "identity.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                identity["generations"][0]["repositoryUrlHistory"],
+                [listing["repositoryUrl"]],
+            )
+
+    def test_repository_rename_requires_same_numeric_repo_and_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            listing = self.upgrade_fixture_to_v2(fixture)
+            for field in ("repositoryId", "ownerId"):
+                with patch.object(validator, "ROOT", fixture.root):
+                    catalog = validator.load_catalog()
+                with (
+                    self.subTest(field=field),
+                    patch.object(validator, "ROOT", fixture.root),
+                    self.assertRaisesRegex(
+                        ValidationFailure, "repositoryId 与 ownerId"
+                    ),
+                ):
+                    validator.merge_publisher_snapshot(
+                        {fixture.plugin_id: catalog[0]},
+                        {
+                            **listing,
+                            "repositoryUrl": "https://github.com/example/renamed",
+                            field: listing[field] + 1,
+                        },
+                    )
+
+    def test_offboarded_reviewer_revocation_is_historical_but_not_green(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            self.upgrade_fixture_to_v2(fixture)
+            review = json.loads(fixture.review_path.read_text(encoding="utf-8"))
+            review.update(
+                {
+                    "status": "revoked",
+                    "stateBy": "FormerAdmin",
+                    "stateById": 999,
+                    "stateAt": "2026-08-21T00:00:00Z",
+                    "lastCommandAt": "2026-08-21T00:00:00Z",
+                    "lastCommentId": 123456790,
+                    "notes": "Revoked before reviewer offboarding.",
+                }
+            )
+            write_json(fixture.review_path, review)
+            with patch.object(validator, "ROOT", fixture.root):
+                index = validator.build_index_v2()
+            self.assertNotIn("review", index["plugins"][0]["releases"][0])
+
+            review["status"] = "verified"
+            write_json(fixture.review_path, review)
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                self.assertRaisesRegex(ValidationFailure, "trustedReviewers"),
+            ):
+                validator.build_index_v2()
+
+    def test_schema1_keeps_yanked_archive_but_schema2_v1_hides_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            archived_id = "dev.example.archived"
+            archived_url = "https://github.com/example/archived"
+            archived_root = fixture.root / "plugins" / archived_id
+            archived_plugin = json.loads(
+                fixture.plugin_path.read_text(encoding="utf-8")
+            )
+            archived_plugin.update(
+                {"id": archived_id, "repositoryUrl": archived_url}
+            )
+            archived_release = json.loads(
+                fixture.release_path.read_text(encoding="utf-8")
+            )
+            archived_release["releaseNotesUrl"] = archived_release[
+                "releaseNotesUrl"
+            ].replace("https://github.com/example/test/", archived_url + "/")
+            archived_release["download"]["url"] = archived_release["download"][
+                "url"
+            ].replace("https://github.com/example/test/", archived_url + "/")
+            archived_release["yanked"] = True
+            archived_release["yankReason"] = "Legacy archive."
+            write_json(archived_root / "plugin.json", archived_plugin)
+            write_json(
+                archived_root / "releases" / "1.0.0.json", archived_release
+            )
+
+            with patch.object(validator, "ROOT", fixture.root):
+                schema1 = validator.build_index()
+            self.assertEqual(
+                {plugin["id"] for plugin in schema1["plugins"]},
+                {fixture.plugin_id, archived_id},
+            )
+
+            self.upgrade_fixture_to_v2(fixture)
+            archived_release["generation"] = 1
+            write_json(
+                archived_root / "releases" / "1.0.0.json", archived_release
+            )
+            write_json(
+                archived_root / "identity.json",
+                {
+                    "schemaVersion": 1,
+                    "id": archived_id,
+                    "lineageId": "33333333-3333-4333-8333-333333333333",
+                    "generation": 1,
+                    "lifecycleStatus": "retired",
+                    "generations": [
+                        {
+                            "generation": 1,
+                            "repositoryUrl": archived_url,
+                            "repositoryUrlHistory": [archived_url],
+                            "repositoryId": 1002,
+                            "ownerId": 101,
+                            "status": "retired",
+                        }
+                    ],
+                },
+            )
+            with patch.object(validator, "ROOT", fixture.root):
+                schema2_v1 = validator.build_index()
+                schema2 = validator.build_index_v2()
+            self.assertEqual(
+                [plugin["id"] for plugin in schema2_v1["plugins"]],
+                [fixture.plugin_id],
+            )
+            archived = next(
+                plugin for plugin in schema2["plugins"] if plugin["id"] == archived_id
+            )
+            self.assertEqual(archived["visibility"], "hidden")
+
+    def test_schema2_bootstrap_anchor_allows_registry_growth_and_offboarding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            listing = self.upgrade_fixture_to_v2(fixture)
+            repository_path = fixture.root / "repository.json"
+            repository = json.loads(repository_path.read_text(encoding="utf-8"))
+            repository["trustedReviewers"] = ["TouristH", "NewAdmin"]
+            repository["trustedReviewerIds"] = {
+                "TouristH": 143396778,
+                "NewAdmin": 777,
+            }
+            write_json(repository_path, repository)
+            extra_id = "dev.example.extra"
+            extra_url = "https://github.com/example/extra"
+            extra_listing = {
+                "id": extra_id,
+                "lineageId": "33333333-3333-4333-8333-333333333333",
+                "generation": 1,
+                "repositoryUrl": extra_url,
+                "repositoryId": 1002,
+                "ownerId": 101,
+            }
+            write_json(fixture.root / "plugins.json", [listing, extra_listing])
+            extra_plugin = json.loads(
+                fixture.plugin_path.read_text(encoding="utf-8")
+            )
+            extra_plugin.update({"id": extra_id, "repositoryUrl": extra_url})
+            write_json(
+                fixture.root / "plugins" / extra_id / "plugin.json", extra_plugin
+            )
+            write_json(
+                fixture.root / "migrations" / "v2-bootstrap.json",
+                {
+                    "$schema": "../schemas/registry-bootstrap-v1.schema.json",
+                    "schemaVersion": 1,
+                    "targetRepositorySchemaVersion": 2,
+                    "trustedReviewerIds": {"TouristH": 143396778},
+                    "targetTrustedReviewerIds": {"TouristH": 143396778},
+                    "publisherBindings": {
+                        fixture.plugin_id: {
+                            "lineageId": listing["lineageId"],
+                            "repositoryUrl": listing["repositoryUrl"],
+                            "repositoryId": listing["repositoryId"],
+                            "ownerId": listing["ownerId"],
+                        }
+                    },
+                },
+            )
+            with patch.object(validator, "ROOT", fixture.root):
+                validator.validate_bootstrap_anchor()
+
+            repository["trustedReviewers"] = ["NewAdmin"]
+            repository["trustedReviewerIds"] = {"NewAdmin": 777}
+            write_json(repository_path, repository)
+            with patch.object(validator, "ROOT", fixture.root):
+                validator.validate_bootstrap_anchor()
+
+            identity_path = (
+                fixture.root
+                / "plugins"
+                / fixture.plugin_id
+                / "identity.json"
+            )
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            identity["generations"][0]["repositoryId"] += 1
+            write_json(identity_path, identity)
+            with (
+                patch.object(validator, "ROOT", fixture.root),
+                self.assertRaisesRegex(ValidationFailure, "g1 identity"),
+            ):
+                validator.validate_bootstrap_anchor()
+
+    def test_existing_details_history_is_generation_aware(self):
+        existing_details = [
+            {
+                "id": "dev.example.test",
+                "releases": [
+                    {"generation": 1, "version": "1.0.0"},
+                ],
+            }
+        ]
+        catalog = [
+            {
+                "id": "dev.example.test",
+                "releases": [
+                    {"generation": 2, "version": "1.0.0"},
+                ],
+            }
+        ]
+
+        with self.assertRaisesRegex(ValidationFailure, "g1"):
+            validator.ensure_existing_details_history(existing_details, catalog)
+
     def test_same_version_snapshot_is_immutable(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
@@ -1347,6 +1765,115 @@ class PublisherRefreshTests(unittest.TestCase):
                 ).exists()
             )
 
+    def test_retired_numeric_publisher_reactivates_same_lineage_with_new_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            lineage_id = "22222222-2222-4222-8222-222222222222"
+            renamed_url = "https://github.com/example/renamed"
+            repository = json.loads(
+                (fixture.root / "repository.json").read_text(encoding="utf-8")
+            )
+            repository.update(
+                {
+                    "schemaVersion": 2,
+                    "indexV2Path": "public/v2/index.json",
+                    "v2MinimumLauncherVersion": "0.1.2-testplug.1",
+                    "trustedReviewerIds": {"TouristH": 143396778},
+                }
+            )
+            write_json(fixture.root / "repository.json", repository)
+            write_json(
+                fixture.root / "plugins.json",
+                [
+                    {
+                        "id": fixture.plugin_id,
+                        "lineageId": lineage_id,
+                        "generation": 1,
+                        "repositoryUrl": "https://github.com/example/test",
+                        "repositoryId": 1001,
+                        "ownerId": 101,
+                    }
+                ],
+            )
+            write_json(
+                fixture.root / "plugins" / fixture.plugin_id / "identity.json",
+                {
+                    "schemaVersion": 1,
+                    "id": fixture.plugin_id,
+                    "lineageId": lineage_id,
+                    "generation": 1,
+                    "lifecycleStatus": "retired",
+                    "generations": [
+                        {
+                            "generation": 1,
+                            "repositoryUrl": "https://github.com/example/test",
+                            "repositoryUrlHistory": [
+                                "https://github.com/example/test"
+                            ],
+                            "repositoryId": 1001,
+                            "ownerId": 101,
+                            "status": "retired",
+                        }
+                    ],
+                },
+            )
+            historical = json.loads(fixture.release_path.read_text(encoding="utf-8"))
+            historical["generation"] = 1
+            historical["yanked"] = True
+            historical["yankReason"] = "Author retired the plugin."
+            write_json(fixture.release_path, historical)
+            review = json.loads(fixture.review_path.read_text(encoding="utf-8"))
+            review["generation"] = 1
+            review["stateById"] = 143396778
+            review["status"] = "revoked"
+            write_json(fixture.review_path, review)
+
+            newer = publisher_with(publisher_release("1.1.0"))
+            newer["repository_url"] = renamed_url
+            newer_release = newer["releases"][-1]
+            newer_release["release_notes_url"] = newer_release[
+                "release_notes_url"
+            ].replace("https://github.com/example/test/", renamed_url + "/")
+            newer_release["download"]["url"] = newer_release["download"][
+                "url"
+            ].replace("https://github.com/example/test/", renamed_url + "/")
+            listing = json.loads(
+                (fixture.root / "plugins.json").read_text(encoding="utf-8")
+            )[0]
+            listing["repositoryUrl"] = renamed_url
+            write_json(fixture.root / "plugins.json", [listing])
+            details = self.refresh(fixture, newer, write=True)
+
+            self.assertEqual(details[0]["lineageId"], lineage_id)
+            self.assertEqual(details[0]["generation"], 1)
+            self.assertEqual(details[0]["lifecycleStatus"], "active")
+            self.assertEqual(details[0]["visibility"], "listed")
+            self.assertEqual(
+                [release["version"] for release in details[0]["releases"]],
+                ["1.1.0", "1.0.0"],
+            )
+            identity = json.loads(
+                (
+                    fixture.root
+                    / "plugins"
+                    / fixture.plugin_id
+                    / "identity.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(identity["lineageId"], lineage_id)
+            self.assertEqual(identity["generation"], 1)
+            self.assertEqual(identity["lifecycleStatus"], "active")
+            self.assertEqual(identity["generations"][0]["status"], "active")
+            self.assertEqual(
+                identity["generations"][0]["repositoryUrlHistory"],
+                ["https://github.com/example/test", renamed_url],
+            )
+            with patch.object(validator, "ROOT", fixture.root):
+                index = validator.build_index()
+                index_v2 = validator.build_index_v2()
+            self.assertEqual(index["plugins"], [])
+            self.assertEqual(index_v2["plugins"][0]["id"], fixture.plugin_id)
+
     def test_new_version_preserves_an_administrator_yank_override(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
@@ -1569,7 +2096,7 @@ class RegistryGenerationTests(unittest.TestCase):
             ):
                 validator.load_plugin_list()
 
-    def test_archived_plugin_is_allowed_when_every_release_is_yanked(self):
+    def test_schema1_archived_plugin_stays_in_v1_when_every_release_is_yanked(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
             write_json(fixture.root / "plugins.json", [])
@@ -1582,8 +2109,10 @@ class RegistryGenerationTests(unittest.TestCase):
 
             self.assertEqual(index["plugins"][0]["id"], fixture.plugin_id)
             self.assertTrue(index["plugins"][0]["releases"][0]["yanked"])
+            self.assertNotIn("visibility", index["plugins"][0])
+            self.assertNotIn("generation", index["plugins"][0]["releases"][0])
 
-    def test_monitored_publisher_pointer_is_kept_when_all_releases_are_yanked(self):
+    def test_schema1_active_pointer_stays_in_v1_when_all_releases_are_yanked(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
             release = json.loads(fixture.release_path.read_text(encoding="utf-8"))
@@ -1593,7 +2122,10 @@ class RegistryGenerationTests(unittest.TestCase):
 
             index = self.build_fixture(fixture)
 
+            self.assertEqual(index["plugins"][0]["id"], fixture.plugin_id)
             self.assertTrue(index["plugins"][0]["releases"][0]["yanked"])
+            self.assertNotIn("visibility", index["plugins"][0])
+            self.assertNotIn("generation", index["plugins"][0]["releases"][0])
 
     def test_archived_plugin_with_an_active_release_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

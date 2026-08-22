@@ -1,0 +1,26 @@
+{
+  "$schema": "../schemas/registry-bootstrap-v1.schema.json",
+  "schemaVersion": 1,
+  "targetRepositorySchemaVersion": 2,
+  "trustedReviewerIds": {
+    "TouristH": 143396778
+  },
+  "targetTrustedReviewerIds": {
+    "TouristH": 143396778,
+    "redstore-noob": 206107690
+  },
+  "publisherBindings": {
+    "io.github.touristh.clock": {
+      "lineageId": "dc538577-8d88-50e4-ba9e-10620bc5ba10",
+      "repositoryUrl": "https://github.com/redstore-noob/NyaLauncher",
+      "repositoryId": 1317097635,
+      "ownerId": 206107690
+    },
+    "io.github.touristh.example-clock": {
+      "lineageId": "9d0f81a3-4f25-5699-ac57-ece4c106e045",
+      "repositoryUrl": "https://github.com/TouristH/NyaLauncher.Clock",
+      "repositoryId": 1341064957,
+      "ownerId": 143396778
+    }
+  }
+}

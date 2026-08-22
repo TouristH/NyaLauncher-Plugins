@@ -55,6 +55,7 @@ class ReviewPermissionFailure(ReviewFailure):
 class ReviewCommand:
     action: str
     plugin_id: str
+    generation: int
     version: str
     sha256: str
     note: str | None
@@ -102,19 +103,27 @@ def parse_command(body: object) -> ReviewCommand:
     match = COMMAND.fullmatch(body)
     if match is None:
         raise ReviewPermissionFailure(
-            "命令格式必须为 /verify id@version sha256:<lower64> [说明]，"
-            "或 /revoke-review id@version sha256:<lower64> [原因]"
+            "命令格式必须为 /verify id@generation:version sha256:<lower64> [说明]，"
+            "或 /revoke-review id@generation:version sha256:<lower64> [原因]"
         )
 
     target = match.group("target")
     if target.count("@") != 1:
         raise ReviewPermissionFailure("审核目标必须为 id@version")
-    plugin_id, version = target.split("@", 1)
+    plugin_id, generation_version = target.split("@", 1)
     if (
         len(plugin_id) > 128
         or validator.PLUGIN_ID.fullmatch(plugin_id) is None
     ):
         raise ReviewPermissionFailure("审核命令中的插件 ID 无效")
+    generation = 1
+    version = generation_version
+    generation_match = re.fullmatch(r"g([1-9][0-9]*):(.+)", generation_version)
+    if generation_match is not None:
+        generation = int(generation_match.group(1))
+        version = generation_match.group(2)
+    if generation > 2**31 - 1:
+        raise ReviewPermissionFailure("审核命令中的 generation 超过 Int32")
     if len(version) > 64 or validator.match_semver(version) is None:
         raise ReviewPermissionFailure("审核命令中的版本必须是严格 SemVer")
 
@@ -133,6 +142,7 @@ def parse_command(body: object) -> ReviewCommand:
     return ReviewCommand(
         action=match.group("action"),
         plugin_id=plugin_id,
+        generation=generation,
         version=version,
         sha256=match.group("sha256"),
         note=note,
@@ -159,6 +169,50 @@ def trusted_reviewers() -> set[str]:
     return {item.casefold() for item in reviewers}
 
 
+def trusted_reviewer_ids() -> dict[str, int]:
+    try:
+        value = json.loads((ROOT / "repository.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise ReviewFailure("无法读取 repository.json") from exc
+    if not isinstance(value, dict):
+        raise ReviewFailure("repository.json 配置无效")
+    schema_version = value.get("schemaVersion")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise ReviewFailure("repository.json schemaVersion 必须精确为整数 1 或 2")
+    reviewer_ids = value.get("trustedReviewerIds")
+    if reviewer_ids is None and schema_version == 1:
+        anchor_path = ROOT / "migrations" / "v2-bootstrap.json"
+        if not anchor_path.exists():
+            return {}
+        try:
+            anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            if not isinstance(anchor, dict):
+                raise TypeError("bootstrap root must be an object")
+            reviewer_ids = anchor["trustedReviewerIds"]
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ReviewFailure("无法读取 bootstrap trustedReviewerIds") from exc
+    if not isinstance(reviewer_ids, dict):
+        raise ReviewFailure("trustedReviewerIds 配置无效")
+    result: dict[str, int] = {}
+    for login, reviewer_id in reviewer_ids.items():
+        if (
+            not isinstance(login, str)
+            or validator.GITHUB_LOGIN.fullmatch(login) is None
+            or type(reviewer_id) is not int
+            or not 1 <= reviewer_id <= 2**63 - 1
+            or login.casefold() in result
+        ):
+            raise ReviewFailure("trustedReviewerIds 配置无效")
+        result[login.casefold()] = reviewer_id
+    return result
+
+
+def numeric_reviewer_identity_required() -> bool:
+    return validator.repository_schema_version() >= 2 or bool(
+        trusted_reviewer_ids()
+    )
+
+
 def authorize_event(event: dict) -> tuple[ReviewCommand, str]:
     issue = event.get("issue")
     comment = event.get("comment")
@@ -172,10 +226,22 @@ def authorize_event(event: dict) -> tuple[ReviewCommand, str]:
     command = parse_command(comment.get("body"))
     user = comment.get("user")
     actor = user.get("login") if isinstance(user, dict) else None
+    actor_id = user.get("id") if isinstance(user, dict) else None
+    actor_type = user.get("type") if isinstance(user, dict) else None
+    reviewer_ids = trusted_reviewer_ids()
+    requires_numeric_identity = numeric_reviewer_identity_required()
     if (
         not isinstance(actor, str)
         or validator.GITHUB_LOGIN.fullmatch(actor) is None
         or actor.casefold() not in trusted_reviewers()
+        or (
+            requires_numeric_identity
+            and (
+                type(actor_id) is not int
+                or reviewer_ids.get(actor.casefold()) != actor_id
+                or actor_type != "User"
+            )
+        )
     ):
         raise ReviewPermissionFailure("只有 trustedReviewers 可以执行人工审核命令")
     return command, actor
@@ -279,10 +345,18 @@ def reject_superseded_verify(
     if command.action != "verify":
         return
     reviewers = trusted_reviewers()
+    reviewer_ids = trusted_reviewer_ids()
+    requires_numeric_identity = numeric_reviewer_identity_required()
     for comment in fetch_issue_comments_since(event, current_position[0]):
         user = comment.get("user")
         actor = user.get("login") if isinstance(user, dict) else None
         if not isinstance(actor, str) or actor.casefold() not in reviewers:
+            continue
+        if requires_numeric_identity and (
+            user.get("type") != "User"
+            or type(user.get("id")) is not int
+            or reviewer_ids.get(actor.casefold()) != user.get("id")
+        ):
             continue
         try:
             later_command = parse_command(comment.get("body"))
@@ -290,6 +364,7 @@ def reject_superseded_verify(
             continue
         if (
             later_command.plugin_id != command.plugin_id
+            or later_command.generation != command.generation
             or later_command.version != command.version
             or later_command.sha256 != command.sha256
         ):
@@ -316,13 +391,14 @@ def resolve_canonical_release(command: ReviewCommand) -> tuple[dict, dict]:
         (
             item
             for item in plugin["releases"]
-            if item["version"] == command.version
+            if item.get("generation", 1) == command.generation
+            and item["version"] == command.version
         ),
         None,
     )
     if release is None:
         raise ReviewFailure(
-            f"版本尚未收录：{command.plugin_id} {command.version}"
+            f"版本尚未收录：{command.plugin_id} g{command.generation}:{command.version}"
         )
     canonical_sha256 = release["download"]["sha256"]
     if command.sha256 != canonical_sha256:
@@ -335,13 +411,22 @@ def resolve_canonical_release(command: ReviewCommand) -> tuple[dict, dict]:
 def checked_review_path(command: ReviewCommand) -> Path:
     reviews_root = ROOT / "reviews"
     directory = reviews_root / command.plugin_id
-    path = directory / f"{command.version}.json"
+    generation_directory = (
+        directory
+        if command.generation == 1
+        else directory / f"g{command.generation}"
+    )
+    path = generation_directory / f"{command.version}.json"
     if reviews_root.exists() and (
         not reviews_root.is_dir() or reviews_root.is_symlink()
     ):
         raise ReviewFailure("reviews/ 必须是普通目录")
     if directory.exists() and (not directory.is_dir() or directory.is_symlink()):
         raise ReviewFailure(f"reviews/{command.plugin_id} 必须是普通目录")
+    if generation_directory.exists() and (
+        not generation_directory.is_dir() or generation_directory.is_symlink()
+    ):
+        raise ReviewFailure("审核 generation 路径必须是普通目录")
     if path.exists() and (not path.is_file() or path.is_symlink()):
         raise ReviewFailure("审核记录必须是普通 JSON 文件")
     return path
@@ -352,13 +437,18 @@ def review_source_value(
     *,
     status: str,
     state_by: str,
+    state_by_id: int | None,
     state_at: str,
     last_command_at: str,
     last_comment_id: int,
     note: str | None,
 ) -> dict:
     value = {
-        "$schema": "../../schemas/review-v1.schema.json",
+        "$schema": (
+            "../../schemas/review-v1.schema.json"
+            if command.generation == 1
+            else "../../../schemas/review-v1.schema.json"
+        ),
         "schemaVersion": 1,
         "pluginId": command.plugin_id,
         "version": command.version,
@@ -369,6 +459,10 @@ def review_source_value(
         "lastCommandAt": last_command_at,
         "lastCommentId": last_comment_id,
     }
+    if validator.repository_schema_version() >= 2 or command.generation > 1:
+        value["generation"] = command.generation
+    if state_by_id is not None:
+        value["stateById"] = state_by_id
     if note is not None:
         value["notes"] = note
     return value
@@ -376,6 +470,9 @@ def review_source_value(
 
 def apply_review(event: dict) -> ApplyResult:
     command, actor = authorize_event(event)
+    actor_id = trusted_reviewer_ids().get(actor.casefold())
+    if type(actor_id) is not int and numeric_reviewer_identity_required():
+        raise ReviewFailure("审核者缺少受保护数字身份")
     plugin, release = resolve_canonical_release(command)
     path = checked_review_path(command)
     reviewers = trusted_reviewers()
@@ -390,6 +487,8 @@ def apply_review(event: dict) -> ApplyResult:
             command.version,
             command.sha256,
             reviewers,
+            expected_generation=command.generation,
+            trusted_reviewer_ids=trusted_reviewer_ids() or None,
         )
         current_position = (command_at, comment_id)
         stored_position = (
@@ -412,10 +511,12 @@ def apply_review(event: dict) -> ApplyResult:
 
     if existing is not None and existing["status"] == desired_status:
         state_by = existing["stateBy"]
+        state_by_id = existing.get("stateById")
         state_at = existing["stateAt"]
         note = existing.get("notes")
     else:
         state_by = actor
+        state_by_id = actor_id
         state_at = command_at
         note = command.note
 
@@ -430,6 +531,7 @@ def apply_review(event: dict) -> ApplyResult:
             command,
             status=desired_status,
             state_by=state_by,
+            state_by_id=state_by_id,
             state_at=state_at,
             last_command_at=command_at,
             last_comment_id=comment_id,
@@ -449,7 +551,7 @@ def apply_review(event: dict) -> ApplyResult:
 
 def summary_for(result: ApplyResult) -> str:
     command = result.command
-    target = f"`{command.plugin_id}` `{command.version}`"
+    target = f"`{command.plugin_id}` `g{command.generation}:{command.version}`"
     if command.action == "verify":
         state = "已写入审核状态" if result.changed else "同一命令已处理，幂等完成"
         body = (
@@ -485,6 +587,8 @@ def write_apply_artifacts(
     with github_output_path.open("a", encoding="utf-8", newline="\n") as output:
         output.write(f"action={result.command.action}\n")
         output.write(f"plugin_id={result.command.plugin_id}\n")
+        if validator.repository_schema_version() >= 2:
+            output.write(f"generation={result.command.generation}\n")
         output.write(f"version={result.command.version}\n")
         output.write(f"sha256={result.command.sha256}\n")
         output.write(f"review_path={relative_path}\n")
@@ -508,7 +612,7 @@ def main() -> int:
             command, actor = authorize_event(event)
             print(
                 f"可信审核者 {actor} 已获授权：{command.action} "
-                f"{command.plugin_id}@{command.version}"
+                f"{command.plugin_id}@g{command.generation}:{command.version}"
             )
             return 0
 

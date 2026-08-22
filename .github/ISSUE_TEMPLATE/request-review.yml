@@ -11,6 +11,14 @@ body:
     validations:
       required: true
   - type: input
+    id: generation
+    attributes:
+      label: 代际 / Generation
+      description: 默认首次发布为 1；转让后的新发布者使用 2、3……
+      placeholder: "1"
+    validations:
+      required: true
+  - type: input
     id: version
     attributes:
       label: 版本 / Version
@@ -36,4 +44,4 @@ body:
       value: |
         管理员审核是人工流程，精确绑定插件 ID、版本和 Release ZIP SHA-256。
         Issue 创建后机器人会从中心历史读取 canonical SHA-256，并显示一条可复制的
-        `/verify id@version sha256:...` 命令。请求被接受并不保证一定获得 `verified` 标志。
+        `/verify id@generation:version sha256:...` 命令。请求被接受并不保证一定获得 `verified` 标志。

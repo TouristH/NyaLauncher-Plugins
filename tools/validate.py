@@ -29,6 +29,7 @@ import tempfile
 import unicodedata
 import urllib.error
 import urllib.request
+import uuid
 import zipfile
 import zlib
 from pathlib import Path
@@ -55,6 +56,9 @@ SEMVER = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+LINEAGE_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 GITHUB_REPO = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/?$")
 GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 GITHUB_APP_BOT_LOGIN = re.compile(
@@ -104,6 +108,7 @@ MAXIMUM_ENTRY_BYTES = 512 * 1024 * 1024
 MAXIMUM_ENTRIES = 4096
 MAXIMUM_PLUGIN_COUNT = 2048
 MAXIMUM_RELEASE_COUNT = 128
+MAXIMUM_GENERATION_COUNT = 64
 MAXIMUM_PUBLISHER_HISTORY_BYTES = 4 * 1024 * 1024 * 1024
 MAXIMUM_NEW_RELEASE_COUNT = 16
 MAXIMUM_NEW_RELEASE_BYTES = 512 * 1024 * 1024
@@ -132,6 +137,7 @@ SETTING_SCOPES = {
 }
 WINDOWS_INVALID_FILENAME_CHARACTERS = set('<>:"/\\|?*')
 _MISSING = object()
+LINEAGE_NAMESPACE = uuid.UUID("6ab20a3b-3655-4d64-8d2e-2f46d8b0a801")
 
 
 class ValidationFailure(Exception):
@@ -564,7 +570,12 @@ def github_repository_parts(
     if match is None:
         raise ValidationFailure(f"{source_name(source)}: {field} 必须是 GitHub 仓库根地址")
     owner = match.group(1)
-    repository = match.group(2).removesuffix(".git")
+    raw_repository = match.group(2)
+    repository = (
+        raw_repository[:-4]
+        if raw_repository.casefold().endswith(".git")
+        else raw_repository
+    )
     if (
         GITHUB_LOGIN.fullmatch(owner) is None
         or not 1 <= len(repository) <= 100
@@ -580,12 +591,18 @@ def same_github_repository(left: str, right: str) -> bool:
     right_match = GITHUB_REPO.fullmatch(right)
     if left_match is None or right_match is None:
         return False
+    left_repository = left_match.group(2)
+    right_repository = right_match.group(2)
+    if left_repository.casefold().endswith(".git"):
+        left_repository = left_repository[:-4]
+    if right_repository.casefold().endswith(".git"):
+        right_repository = right_repository[:-4]
     return (
         left_match.group(1).casefold(),
-        left_match.group(2).removesuffix(".git").casefold(),
+        left_repository.casefold(),
     ) == (
         right_match.group(1).casefold(),
-        right_match.group(2).removesuffix(".git").casefold(),
+        right_repository.casefold(),
     )
 
 
@@ -593,6 +610,8 @@ def validate_github_repository_identity(
     value: object,
     repository_url: str,
     source: Path | str,
+    *,
+    allow_archived: bool = False,
 ) -> tuple[int, int, str]:
     """Bind a mutable owner/name path to GitHub's immutable numeric identities."""
 
@@ -618,11 +637,15 @@ def validate_github_repository_identity(
     if (
         value.get("private") is not False
         or value.get("fork") is not False
-        or value.get("archived") is not False
+        or (
+            value.get("archived") is not False
+            and not (allow_archived and value.get("archived") is True)
+        )
         or value.get("disabled") is True
     ):
         raise ValidationFailure(
-            f"{source_name(source)}: 自动发布仓库必须公开、非 Fork、未归档且可用"
+            f"{source_name(source)}: 仓库必须公开、非 Fork、可用"
+            + ("（生命周期源仓库允许已归档）" if allow_archived else "且未归档")
         )
     return repository_id, owner_id, canonical_url
 
@@ -669,12 +692,54 @@ def fetch_github_repository_identity(
     return validate_github_repository_identity(value, canonical_url, source)
 
 
+def repository_url_candidates(
+    source: Path | str,
+    field: str,
+    repository_urls: str | list[str],
+) -> list[str]:
+    """Return a bounded, canonical, case-insensitively unique URL history.
+
+    Publisher manifests only know their current URL, while a durable
+    generation can contain Release links written before one or more GitHub
+    repository renames.  URL paths are therefore aliases for one already
+    numeric-bound publisher generation, never identity by themselves.
+    """
+
+    values: list[object] = (
+        [repository_urls] if isinstance(repository_urls, str) else repository_urls
+    )
+    if not isinstance(values, list) or not 1 <= len(values) <= 64:
+        raise ValidationFailure(
+            f"{source_name(source)}: {field} 必须包含 1 到 64 个仓库地址"
+        )
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        _, _, canonical = github_repository_parts(
+            source, f"{field}[{index}]", value
+        )
+        if value != canonical:
+            raise ValidationFailure(
+                f"{source_name(source)}: {field}[{index}] 必须是无尾斜杠、无 .git 的 canonical URL"
+            )
+        key = canonical.casefold()
+        if key in seen:
+            raise ValidationFailure(
+                f"{source_name(source)}: {field} 不能包含大小写等价的重复地址"
+            )
+        seen.add(key)
+        result.append(canonical)
+    return result
+
+
 def validate_fixed_release_zip(
-    source: Path | str, repository_url: str, value: object
+    source: Path | str, repository_url: str | list[str], value: object
 ) -> str:
     url = require_https(source, "release.download.url", value)
     parsed = urlparse(url)
-    owner, repository, _ = github_repository_parts(source, "repository_url", repository_url)
+    repository_urls = repository_url_candidates(
+        source, "repositoryUrlHistory", repository_url
+    )
     try:
         port = parsed.port
     except ValueError as exc:
@@ -692,8 +757,17 @@ def validate_fixed_release_zip(
             f"{source_name(source)}: download.url 必须是插件仓库的固定 GitHub Release ZIP"
         )
     decoded_path = unquote(parsed.path)
-    prefix = f"/{owner}/{repository}/releases/download/"
-    if not parsed.path.startswith(prefix):
+    prefixes = []
+    for item in repository_urls:
+        owner, repository, _ = github_repository_parts(
+            source, "repositoryUrlHistory", item
+        )
+        prefixes.append(f"/{owner}/{repository}/releases/download/")
+    prefix = next(
+        (candidate for candidate in prefixes if parsed.path.startswith(candidate)),
+        None,
+    )
+    if prefix is None:
         raise ValidationFailure(
             f"{source_name(source)}: download.url 的 owner/repo 必须与 repository_url 大小写精确一致"
         )
@@ -712,16 +786,25 @@ def validate_fixed_release_zip(
 
 
 def validate_release_notes_url(
-    source: Path | str, repository_url: str, value: object
+    source: Path | str, repository_url: str | list[str], value: object
 ) -> str:
     """Require a tag-specific GitHub Release page from the publisher repo."""
 
     url = require_https(source, "release_notes_url", value)
     parsed = urlparse(url)
-    owner, repository, _ = github_repository_parts(
-        source, "repository_url", repository_url
+    repository_urls = repository_url_candidates(
+        source, "repositoryUrlHistory", repository_url
     )
-    prefix = f"/{owner}/{repository}/releases/tag/"
+    prefixes = []
+    for item in repository_urls:
+        owner, repository, _ = github_repository_parts(
+            source, "repositoryUrlHistory", item
+        )
+        prefixes.append(f"/{owner}/{repository}/releases/tag/")
+    prefix = next(
+        (candidate for candidate in prefixes if parsed.path.startswith(candidate)),
+        None,
+    )
     if (
         ascii_fold(parsed.hostname or "") != "github.com"
         or parsed.port not in (None, 443)
@@ -729,11 +812,12 @@ def validate_release_notes_url(
         or parsed.fragment
         or "?" in url
         or "#" in url
-        or not parsed.path.startswith(prefix)
+        or prefix is None
     ):
         raise ValidationFailure(
             f"{source_name(source)}: release_notes_url 必须属于发布仓库的 GitHub Release tag"
         )
+    assert prefix is not None
     tag = unquote(parsed.path[len(prefix) :])
     tag_segments = tag.split("/")
     if any(
@@ -756,6 +840,185 @@ def validate_capabilities(source: Path | str, field: str, value: object) -> list
     return items
 
 
+def repository_schema_version() -> int:
+    """Read only the version discriminator for backwards-compatible fixtures."""
+
+    try:
+        value = load_object(ROOT / "repository.json")
+    except ValidationFailure:
+        return 1
+    version = value.get("schemaVersion")
+    return version if type(version) is int else 1
+
+
+def validate_bootstrap_anchor() -> None:
+    """Self-check the immutable v2 migration trust anchor when present."""
+
+    path = ROOT / "migrations" / "v2-bootstrap.json"
+    if not path.exists():
+        return
+    value = load_object(path)
+    require_exact_keys(
+        path,
+        value,
+        {
+            "schemaVersion",
+            "targetRepositorySchemaVersion",
+            "trustedReviewerIds",
+            "targetTrustedReviewerIds",
+            "publisherBindings",
+        },
+        {"$schema"},
+    )
+    validate_schema_reference(path, value)
+    if value["schemaVersion"] != 1 or value["targetRepositorySchemaVersion"] != 2:
+        raise ValidationFailure(f"{source_name(path)}: migration schema 版本无效")
+    repository = load_object(ROOT / "repository.json")
+    current_reviewers = repository.get("trustedReviewers")
+    current_reviewer_ids = repository.get("trustedReviewerIds")
+    base_ids = value["trustedReviewerIds"]
+    target_ids = value["targetTrustedReviewerIds"]
+    if (
+        not isinstance(current_reviewers, list)
+        or not isinstance(base_ids, dict)
+        or not isinstance(target_ids, dict)
+        or len({str(login).casefold() for login in base_ids}) != len(base_ids)
+        or len({str(login).casefold() for login in target_ids}) != len(target_ids)
+        or any(
+            GITHUB_LOGIN.fullmatch(str(login)) is None
+            or type(actor_id) is not int
+            or not 1 <= actor_id <= 2**63 - 1
+            for mapping in (base_ids, target_ids)
+            for login, actor_id in mapping.items()
+        )
+    ):
+        raise ValidationFailure(f"{source_name(path)}: reviewer numeric trust anchor 无效")
+    normalized_base_ids = {
+        login.casefold(): actor_id for login, actor_id in base_ids.items()
+    }
+    normalized_target_ids = {
+        login.casefold(): actor_id for login, actor_id in target_ids.items()
+    }
+    if (
+        not set(normalized_base_ids).issubset(normalized_target_ids)
+        or any(
+            normalized_target_ids.get(login) != actor_id
+            for login, actor_id in normalized_base_ids.items()
+        )
+        or len(set(normalized_base_ids.values())) != len(normalized_base_ids)
+        or len(set(normalized_target_ids.values())) != len(normalized_target_ids)
+    ):
+        raise ValidationFailure(f"{source_name(path)}: reviewer numeric trust anchor 无效")
+    schema_version = repository_schema_version()
+    current_reviewer_keys = {item.casefold() for item in current_reviewers}
+    if schema_version < 2:
+        if current_reviewer_keys != set(normalized_base_ids):
+            raise ValidationFailure(
+                f"{source_name(path)}: trustedReviewers 与 staged migration 锚点不一致"
+            )
+    else:
+        if not isinstance(current_reviewer_ids, dict):
+            raise ValidationFailure(
+                f"{source_name(path)}: schema v2 缺少 reviewer 数字身份"
+            )
+        normalized_current_ids = {
+            key.casefold(): item for key, item in current_reviewer_ids.items()
+        }
+        if any(
+            normalized_current_ids.get(login) != actor_id
+            for login, actor_id in normalized_target_ids.items()
+            if login in normalized_current_ids
+        ):
+            raise ValidationFailure(
+                f"{source_name(path)}: 锚定 reviewer 登录名不得绑定其他 numeric ID"
+            )
+
+    raw_bindings = value["publisherBindings"]
+    plugins_root = ROOT / "plugins"
+    plugin_ids = {
+        item.name
+        for item in plugins_root.iterdir()
+        if item.is_dir() and PLUGIN_ID.fullmatch(item.name) is not None
+    }
+    if not isinstance(raw_bindings, dict) or (
+        set(raw_bindings) != plugin_ids
+        if schema_version < 2
+        else not set(raw_bindings).issubset(plugin_ids)
+    ):
+        raise ValidationFailure(
+            f"{source_name(path)}: publisherBindings 与迁移时插件目录不一致"
+        )
+    active_by_id = {item["id"]: item for item in load_plugin_list()}
+    seen_lineages: set[str] = set()
+    seen_repository_ids: set[int] = set()
+    for plugin_id, binding in raw_bindings.items():
+        if not isinstance(binding, dict) or set(binding) != {
+            "lineageId",
+            "repositoryUrl",
+            "repositoryId",
+            "ownerId",
+        }:
+            raise ValidationFailure(f"{source_name(path)}: {plugin_id} binding 结构无效")
+        _, _, repository_url = github_repository_parts(
+            path, f"publisherBindings.{plugin_id}.repositoryUrl", binding["repositoryUrl"]
+        )
+        if repository_url != binding["repositoryUrl"]:
+            raise ValidationFailure(f"{source_name(path)}: binding URL 必须 canonical")
+        if (
+            LINEAGE_ID.fullmatch(str(binding["lineageId"])) is None
+            or any(
+                type(binding[key]) is not int
+                or not 1 <= binding[key] <= 2**63 - 1
+                for key in ("repositoryId", "ownerId")
+            )
+        ):
+            raise ValidationFailure(f"{source_name(path)}: {plugin_id} numeric/lineage 无效")
+        if (
+            binding["lineageId"] in seen_lineages
+            or binding["repositoryId"] in seen_repository_ids
+        ):
+            raise ValidationFailure(
+                f"{source_name(path)}: lineageId/repositoryId 锚点必须全局唯一"
+            )
+        seen_lineages.add(binding["lineageId"])
+        seen_repository_ids.add(binding["repositoryId"])
+        source_plugin = validate_plugin(
+            plugins_root / plugin_id / "plugin.json", plugin_id
+        )
+        if (
+            schema_version < 2
+            and source_plugin["repositoryUrl"] != repository_url
+        ):
+            raise ValidationFailure(
+                f"{source_name(path)}: {plugin_id} URL 与冻结 metadata 不一致"
+            )
+        active = active_by_id.get(plugin_id)
+        if schema_version < 2 and active is not None and any(
+            active.get(key) != binding[key]
+            for key in ("repositoryUrl", "repositoryId", "ownerId")
+        ):
+            raise ValidationFailure(
+                f"{source_name(path)}: {plugin_id} active numeric 事实与锚点不一致"
+            )
+        if schema_version >= 2:
+            identity = validate_plugin_identity(
+                plugins_root / plugin_id / "identity.json", plugin_id
+            )
+            first = identity["generations"][0]
+            if (
+                identity["lineageId"] != binding["lineageId"]
+                or any(
+                    first[key] != binding[key]
+                    for key in ("repositoryId", "ownerId")
+                )
+                or not first["repositoryUrlHistory"]
+                or first["repositoryUrlHistory"][0] != binding["repositoryUrl"]
+            ):
+                raise ValidationFailure(
+                    f"{source_name(path)}: {plugin_id} g1 identity 与迁移锚点不一致"
+                )
+
+
 def load_plugin_list() -> list[dict]:
     """Load and strictly validate active publisher pointers from plugins.json."""
 
@@ -764,6 +1027,9 @@ def load_plugin_list() -> list[dict]:
         raise ValidationFailure(f"plugins.json: 插件总数不能超过 {MAXIMUM_PLUGIN_COUNT}")
     result: list[dict] = []
     seen_ids: set[str] = set()
+    seen_lineages: set[str] = {
+        item["lineageId"] for item in load_purge_tombstones()
+    }
     seen_repositories: set[str] = set()
     seen_repository_ids: set[int] = set()
     for index, value in enumerate(values):
@@ -774,7 +1040,7 @@ def load_plugin_list() -> list[dict]:
             source,
             value,
             {"id", "repositoryUrl", "repositoryId", "ownerId"},
-            set(),
+            {"lineageId", "generation"},
         )
         plugin_id = require_text(source, "id", value["id"], 128)
         if PLUGIN_ID.fullmatch(plugin_id) is None:
@@ -784,28 +1050,128 @@ def load_plugin_list() -> list[dict]:
         )
         repository_id = value["repositoryId"]
         owner_id = value["ownerId"]
+        lineage_id = value.get("lineageId")
+        if repository_schema_version() >= 2 and (
+            lineage_id is None or "generation" not in value
+        ):
+            raise ValidationFailure(
+                f"{source}: repository schema v2 必须显式固定 lineageId 和 generation"
+            )
+        if lineage_id is None:
+            lineage_id = str(
+                uuid.uuid5(LINEAGE_NAMESPACE, f"{plugin_id}:{repository_id}")
+            )
+        lineage_id = require_text(source, "lineageId", lineage_id, 36)
+        generation = value.get("generation", 1)
+        if LINEAGE_ID.fullmatch(lineage_id) is None:
+            raise ValidationFailure(f"{source}: lineageId 必须是小写 UUID")
+        if type(generation) is not int or not 1 <= generation <= 2**31 - 1:
+            raise ValidationFailure(f"{source}: generation 必须是正 Int32")
         if type(repository_id) is not int or not 1 <= repository_id <= 2**63 - 1:
             raise ValidationFailure(f"{source}: repositoryId 必须是正 Int64")
         if type(owner_id) is not int or not 1 <= owner_id <= 2**63 - 1:
             raise ValidationFailure(f"{source}: ownerId 必须是正 Int64")
         if plugin_id.casefold() in seen_ids:
             raise ValidationFailure(f"{source}: 插件 ID 重复")
+        if lineage_id in seen_lineages:
+            raise ValidationFailure(f"{source}: lineageId 重复")
         if repository_url.casefold() in seen_repositories:
             raise ValidationFailure(f"{source}: 同一发布仓库不能重复收录")
         if repository_id in seen_repository_ids:
             raise ValidationFailure(f"{source}: 同一 GitHub repositoryId 不能重复收录")
         seen_ids.add(plugin_id.casefold())
+        seen_lineages.add(lineage_id)
         seen_repositories.add(repository_url.casefold())
         seen_repository_ids.add(repository_id)
         result.append(
             {
                 "id": plugin_id,
+                "lineageId": lineage_id,
+                "generation": generation,
                 "repositoryUrl": repository_url,
                 "repositoryId": repository_id,
                 "ownerId": owner_id,
             }
         )
     return sorted(result, key=lambda item: item["id"].casefold())
+
+
+def load_purge_tombstones() -> list[dict]:
+    """Validate permanent lineage tombstones left by exceptional purges."""
+
+    root = ROOT / "tombstones"
+    if not root.exists():
+        return []
+    if not root.is_dir() or root.is_symlink():
+        raise ValidationFailure("tombstones/: 必须是普通目录")
+    result: list[dict] = []
+    seen_lineages: set[str] = set()
+    for plugin_directory in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+        if plugin_directory.name == "README.md" and plugin_directory.is_file():
+            continue
+        if (
+            not plugin_directory.is_dir()
+            or plugin_directory.is_symlink()
+            or PLUGIN_ID.fullmatch(plugin_directory.name) is None
+        ):
+            raise ValidationFailure(
+                f"{source_name(plugin_directory)}: 墓碑必须位于合法插件 ID 目录"
+            )
+        for path in sorted(plugin_directory.iterdir(), key=lambda item: item.name):
+            if not path.is_file() or path.is_symlink() or path.suffix != ".json":
+                raise ValidationFailure(f"{source_name(path)}: 墓碑目录只能包含普通 JSON")
+            value = load_object(path)
+            require_exact_keys(
+                path,
+                value,
+                {
+                    "schemaVersion",
+                    "id",
+                    "lineageId",
+                    "generation",
+                    "repositoryId",
+                    "ownerId",
+                    "purgedBy",
+                    "purgedById",
+                    "purgedAt",
+                    "issueNumber",
+                    "commentId",
+                    "reason",
+                },
+                {"$schema"},
+            )
+            validate_schema_reference(path, value)
+            if type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1:
+                raise ValidationFailure(f"{source_name(path)}: schemaVersion 必须是 1")
+            if value["id"] != plugin_directory.name:
+                raise ValidationFailure(f"{source_name(path)}: id 必须与墓碑目录一致")
+            lineage_id = require_text(path, "lineageId", value["lineageId"], 36)
+            if LINEAGE_ID.fullmatch(lineage_id) is None or path.stem != lineage_id:
+                raise ValidationFailure(
+                    f"{source_name(path)}: 文件名和 lineageId 必须是同一个小写 UUID"
+                )
+            if lineage_id in seen_lineages:
+                raise ValidationFailure(f"{source_name(path)}: lineageId 墓碑重复")
+            seen_lineages.add(lineage_id)
+            for field in (
+                "generation",
+                "repositoryId",
+                "ownerId",
+                "purgedById",
+                "issueNumber",
+                "commentId",
+            ):
+                number = value[field]
+                maximum = 2**31 - 1 if field == "generation" else 2**63 - 1
+                if type(number) is not int or not 1 <= number <= maximum:
+                    raise ValidationFailure(f"{source_name(path)}: {field} 必须是正整数")
+            actor = require_text(path, "purgedBy", value["purgedBy"], 39)
+            if GITHUB_LOGIN.fullmatch(actor) is None:
+                raise ValidationFailure(f"{source_name(path)}: purgedBy 不是 GitHub 登录名")
+            validate_utc_timestamp(path, "purgedAt", value["purgedAt"])
+            require_text(path, "reason", value["reason"], 1024)
+            result.append(copy.deepcopy(value))
+    return result
 
 
 def is_allowed_manifest_url(url: str) -> bool:
@@ -901,7 +1267,13 @@ def fetch_publisher_manifest(listing: dict) -> dict:
         "publisher listing",
         listing,
         {"id", "repositoryUrl"},
-        {"repositoryId", "ownerId"},
+        {
+            "repositoryId",
+            "ownerId",
+            "lineageId",
+            "generation",
+            "repositoryUrlHistory",
+        },
     )
     plugin_id = require_text("publisher listing", "id", listing["id"], 128)
     if PLUGIN_ID.fullmatch(plugin_id) is None:
@@ -918,12 +1290,22 @@ def fetch_publisher_manifest(listing: dict) -> dict:
             raise ValidationFailure(
                 f"{plugin_id}: GitHub numeric repository identity 已变化，拒绝自动同步"
             )
+    if "lineageId" in listing:
+        lineage_id = require_text(
+            "publisher listing", "lineageId", listing["lineageId"], 36
+        )
+        if LINEAGE_ID.fullmatch(lineage_id) is None:
+            raise ValidationFailure("publisher listing: lineageId 必须是小写 UUID")
+    if "generation" in listing:
+        generation = listing["generation"]
+        if type(generation) is not int or not 1 <= generation <= 2**31 - 1:
+            raise ValidationFailure("publisher listing: generation 必须是正 Int32")
     return fetch_repository_manifest(listing["repositoryUrl"], plugin_id)
 
 
 def validate_publisher_release(
     source: str,
-    repository_url: str,
+    repository_url: str | list[str],
     value: object,
     index: int,
 ) -> dict:
@@ -1092,8 +1474,23 @@ def validate_publisher_manifest_releases(
         raise ValidationFailure(
             f"{source}: releases 必须包含 1 到 {MAXIMUM_RELEASE_COUNT} 个完整历史版本"
         )
+    repository_url_history = listing.get(
+        "repositoryUrlHistory", [listing_repository]
+    )
+    repository_url_history = repository_url_candidates(
+        source, "repositoryUrlHistory", repository_url_history
+    )
+    if repository_url_history[-1] != repository_url:
+        if not same_github_repository(repository_url_history[-1], repository_url):
+            raise ValidationFailure(
+                f"{source}: repositoryUrlHistory 末项必须是当前 repository_url"
+            )
+        # GitHub paths are case-insensitive.  Preserve the already-bound
+        # canonical spelling instead of creating a case-only duplicate alias.
+        repository_url = repository_url_history[-1]
+        plugin["repositoryUrl"] = repository_url
     releases = [
-        validate_publisher_release(source, repository_url, release, index)
+        validate_publisher_release(source, repository_url_history, release, index)
         for index, release in enumerate(publisher_releases)
     ]
     if sum(release["download"]["size"] for release in releases) > (
@@ -1113,6 +1510,250 @@ def validate_publisher_manifest(value: dict, listing: dict) -> tuple[dict, dict]
 
     plugin, releases = validate_publisher_manifest_releases(value, listing)
     return plugin, releases[-1]
+
+
+def validate_plugin_identity(path: Path, directory_name: str) -> dict:
+    """Load one durable lineage and validate every numeric publisher binding."""
+
+    value = load_object(path)
+    require_exact_keys(
+        path,
+        value,
+        {
+            "schemaVersion",
+            "id",
+            "lineageId",
+            "generation",
+            "lifecycleStatus",
+            "generations",
+        },
+        {"$schema", "events"},
+    )
+    validate_schema_reference(path, value)
+    if type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1:
+        raise ValidationFailure(f"{source_name(path)}: schemaVersion 必须是 1")
+    plugin_id = require_text(path, "id", value["id"], 128)
+    if plugin_id != directory_name or PLUGIN_ID.fullmatch(plugin_id) is None:
+        raise ValidationFailure(f"{source_name(path)}: id 必须与插件目录一致")
+    lineage_id = require_text(path, "lineageId", value["lineageId"], 36)
+    if LINEAGE_ID.fullmatch(lineage_id) is None:
+        raise ValidationFailure(f"{source_name(path)}: lineageId 必须是小写 UUID")
+    generation = value["generation"]
+    if type(generation) is not int or not 1 <= generation <= 2**31 - 1:
+        raise ValidationFailure(f"{source_name(path)}: generation 必须是正 Int32")
+    lifecycle_status = value["lifecycleStatus"]
+    if lifecycle_status not in {"active", "retired", "transferred"}:
+        raise ValidationFailure(
+            f"{source_name(path)}: lifecycleStatus 必须是 active、retired 或 transferred"
+        )
+    raw_generations = value["generations"]
+    if (
+        not isinstance(raw_generations, list)
+        or not 1 <= len(raw_generations) <= MAXIMUM_GENERATION_COUNT
+    ):
+        raise ValidationFailure(
+            f"{source_name(path)}: generations 必须包含 1 到 {MAXIMUM_GENERATION_COUNT} 代"
+        )
+    bindings: list[dict] = []
+    seen_repository_ids: set[int] = set()
+    for index, raw_binding in enumerate(raw_generations, start=1):
+        binding_source = f"{source_name(path)}.generations[{index - 1}]"
+        if not isinstance(raw_binding, dict):
+            raise ValidationFailure(f"{binding_source}: 必须是对象")
+        require_exact_keys(
+            binding_source,
+            raw_binding,
+            {
+                "generation",
+                "repositoryUrl",
+                "repositoryUrlHistory",
+                "repositoryId",
+                "ownerId",
+                "status",
+            },
+            set(),
+        )
+        binding_generation = raw_binding["generation"]
+        if type(binding_generation) is not int or binding_generation != index:
+            raise ValidationFailure(f"{binding_source}: generation 必须从 1 连续递增")
+        _, _, repository_url = github_repository_parts(
+            binding_source, "repositoryUrl", raw_binding["repositoryUrl"]
+        )
+        repository_url_history = repository_url_candidates(
+            binding_source,
+            "repositoryUrlHistory",
+            raw_binding["repositoryUrlHistory"],
+        )
+        if repository_url_history[-1] != repository_url:
+            raise ValidationFailure(
+                f"{binding_source}: repositoryUrlHistory 末项必须与 repositoryUrl 完全一致"
+            )
+        repository_id = raw_binding["repositoryId"]
+        owner_id = raw_binding["ownerId"]
+        if type(repository_id) is not int or not 1 <= repository_id <= 2**63 - 1:
+            raise ValidationFailure(f"{binding_source}: repositoryId 必须是正 Int64")
+        if type(owner_id) is not int or not 1 <= owner_id <= 2**63 - 1:
+            raise ValidationFailure(f"{binding_source}: ownerId 必须是正 Int64")
+        if repository_id in seen_repository_ids:
+            raise ValidationFailure(
+                f"{binding_source}: 已绑定的 GitHub repositoryId 不能作为新一代重复使用"
+            )
+        seen_repository_ids.add(repository_id)
+        status = raw_binding["status"]
+        if status not in {"active", "retired", "transferred"}:
+            raise ValidationFailure(f"{binding_source}: status 无效")
+        if index < len(raw_generations) and status != "transferred":
+            raise ValidationFailure(f"{binding_source}: 非当前代必须标记 transferred")
+        bindings.append(
+            {
+                "generation": binding_generation,
+                "repositoryUrl": repository_url,
+                "repositoryUrlHistory": repository_url_history,
+                "repositoryId": repository_id,
+                "ownerId": owner_id,
+                "status": status,
+            }
+        )
+    if generation != len(bindings):
+        raise ValidationFailure(f"{source_name(path)}: generation 必须等于最后一代")
+    current = bindings[-1]
+    expected_current_status = "retired" if lifecycle_status == "retired" else "active"
+    if current["status"] != expected_current_status:
+        raise ValidationFailure(
+            f"{source_name(path)}: 当前代 status 与 lifecycleStatus 不一致"
+        )
+    if lifecycle_status == "transferred" and generation < 2:
+        raise ValidationFailure(
+            f"{source_name(path)}: transferred 必须至少包含两代绑定"
+        )
+    events_value = value.get("events", [])
+    if not isinstance(events_value, list) or len(events_value) > 256:
+        raise ValidationFailure(f"{source_name(path)}: events 必须是最多 256 项的数组")
+    events: list[dict] = []
+    seen_comment_ids: set[int] = set()
+    for event_index, raw_event in enumerate(events_value):
+        event_source = f"{source_name(path)}.events[{event_index}]"
+        if not isinstance(raw_event, dict):
+            raise ValidationFailure(f"{event_source}: 必须是对象")
+        operation = raw_event.get("operation")
+        required = {
+            "operation",
+            "generation",
+            "sourceRepositoryId",
+            "actor",
+            "actorId",
+            "occurredAt",
+            "issueNumber",
+            "commentId",
+            "reason",
+            "authorConfirmation",
+        }
+        optional = {"targetGeneration", "targetRepositoryId"}
+        require_exact_keys(event_source, raw_event, required, optional)
+        if operation not in {"retire", "transfer"}:
+            raise ValidationFailure(f"{event_source}: operation 无效")
+        event_generation = raw_event["generation"]
+        if (
+            type(event_generation) is not int
+            or not 1 <= event_generation <= generation
+        ):
+            raise ValidationFailure(f"{event_source}: generation 超出已绑定代际")
+        source_repository_id = raw_event["sourceRepositoryId"]
+        if source_repository_id != bindings[event_generation - 1]["repositoryId"]:
+            raise ValidationFailure(
+                f"{event_source}: sourceRepositoryId 与对应代际绑定不一致"
+            )
+        actor = require_text(event_source, "actor", raw_event["actor"], 39)
+        if GITHUB_LOGIN.fullmatch(actor) is None:
+            raise ValidationFailure(f"{event_source}: actor 不是 GitHub 登录名")
+        actor_id = raw_event["actorId"]
+        issue_number = raw_event["issueNumber"]
+        comment_id = raw_event["commentId"]
+        for key, number in (
+            ("actorId", actor_id),
+            ("issueNumber", issue_number),
+            ("commentId", comment_id),
+        ):
+            if type(number) is not int or not 1 <= number <= 2**63 - 1:
+                raise ValidationFailure(f"{event_source}: {key} 必须是正 Int64")
+        if comment_id in seen_comment_ids:
+            raise ValidationFailure(f"{event_source}: commentId 不能重复")
+        seen_comment_ids.add(comment_id)
+        occurred_at = validate_utc_timestamp(
+            event_source, "occurredAt", raw_event["occurredAt"]
+        )
+        reason = require_text(event_source, "reason", raw_event["reason"], 1024)
+        confirmation = raw_event["authorConfirmation"]
+        if not isinstance(confirmation, dict):
+            raise ValidationFailure(f"{event_source}: authorConfirmation 必须是对象")
+        confirmation_kind = confirmation.get("kind")
+        if confirmation_kind == "owner-comment":
+            require_exact_keys(
+                f"{event_source}.authorConfirmation",
+                confirmation,
+                {"kind", "ownerId", "commentId"},
+                set(),
+            )
+            if (
+                confirmation["ownerId"]
+                != bindings[event_generation - 1]["ownerId"]
+                or type(confirmation["commentId"]) is not int
+                or not 1 <= confirmation["commentId"] < comment_id
+            ):
+                raise ValidationFailure(
+                    f"{event_source}: owner-comment 数字身份或顺序无效"
+                )
+        elif confirmation_kind == "repository-file":
+            require_exact_keys(
+                f"{event_source}.authorConfirmation",
+                confirmation,
+                {"kind", "sha256"},
+                set(),
+            )
+            if SHA256.fullmatch(str(confirmation["sha256"])) is None:
+                raise ValidationFailure(
+                    f"{event_source}: repository-file sha256 无效"
+                )
+        else:
+            raise ValidationFailure(f"{event_source}: authorConfirmation.kind 无效")
+        event = {
+            "operation": operation,
+            "generation": event_generation,
+            "sourceRepositoryId": source_repository_id,
+            "actor": actor,
+            "actorId": actor_id,
+            "occurredAt": occurred_at,
+            "issueNumber": issue_number,
+            "commentId": comment_id,
+            "reason": reason,
+            "authorConfirmation": copy.deepcopy(confirmation),
+        }
+        if operation == "transfer":
+            target_generation = raw_event.get("targetGeneration")
+            target_repository_id = raw_event.get("targetRepositoryId")
+            if (
+                type(target_generation) is not int
+                or target_generation != event_generation + 1
+                or target_generation > generation
+                or target_repository_id
+                != bindings[target_generation - 1]["repositoryId"]
+            ):
+                raise ValidationFailure(
+                    f"{event_source}: transfer 目标代际或 repositoryId 与绑定不一致"
+                )
+            event["targetGeneration"] = target_generation
+            event["targetRepositoryId"] = target_repository_id
+        elif optional & raw_event.keys():
+            raise ValidationFailure(f"{event_source}: retire 不能包含 transfer 目标字段")
+        events.append(event)
+    return {
+        "id": plugin_id,
+        "lineageId": lineage_id,
+        "generation": generation,
+        "lifecycleStatus": lifecycle_status,
+        "generations": bindings,
+        "events": events,
+    }
 
 
 def validate_plugin(path: Path, directory_name: str) -> dict:
@@ -1160,7 +1801,12 @@ def validate_plugin(path: Path, directory_name: str) -> dict:
     return result
 
 
-def validate_release(path: Path, file_version: str, plugin: dict) -> dict:
+def validate_release(
+    path: Path,
+    file_version: str,
+    plugin: dict,
+    identity: dict | None = None,
+) -> dict:
     value = load_object(path)
     require_exact_keys(
         path,
@@ -1177,23 +1823,45 @@ def validate_release(path: Path, file_version: str, plugin: dict) -> dict:
             "optionalCapabilities",
             "yanked",
         },
-        {"$schema", "yankReason"},
+        {"$schema", "generation", "yankReason"},
     )
     validate_schema_reference(path, value)
     if type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1:
         raise ValidationFailure(f"{source_name(path)}: schemaVersion 必须是 1")
+    if repository_schema_version() >= 2 and "generation" not in value:
+        raise ValidationFailure(f"{source_name(path)}: schema v2 中 release 必须绑定 generation")
+    generation = value.get("generation", 1)
+    if type(generation) is not int or not 1 <= generation <= 2**31 - 1:
+        raise ValidationFailure(f"{source_name(path)}: generation 必须是正 Int32")
+    release_repository_url = plugin["repositoryUrl"]
+    if identity is not None:
+        binding = next(
+            (
+                item
+                for item in identity["generations"]
+                if item["generation"] == generation
+            ),
+            None,
+        )
+        if binding is None:
+            raise ValidationFailure(
+                f"{source_name(path)}: generation 没有对应的永久发布者绑定"
+            )
+        release_repository_url = binding["repositoryUrlHistory"]
     version = validate_semver(path, "version", value["version"])
     if version != file_version:
         raise ValidationFailure(f"{source_name(path)}: version 必须与文件名一致")
     if not isinstance(value["channel"], str) or value["channel"] not in {"stable", "preview"}:
         raise ValidationFailure(f"{source_name(path)}: channel 只能是 stable 或 preview")
     validate_utc_timestamp(path, "publishedAt", value["publishedAt"])
-    require_https(path, "releaseNotesUrl", value["releaseNotesUrl"])
+    validate_release_notes_url(
+        path, release_repository_url, value["releaseNotesUrl"]
+    )
     download = value["download"]
     if not isinstance(download, dict):
         raise ValidationFailure(f"{source_name(path)}: download 必须是对象")
     require_exact_keys(path, download, {"url", "sha256", "size"}, set())
-    validate_fixed_release_zip(path, plugin["repositoryUrl"], download["url"])
+    validate_fixed_release_zip(path, release_repository_url, download["url"])
     if not isinstance(download["sha256"], str) or SHA256.fullmatch(download["sha256"]) is None:
         raise ValidationFailure(f"{source_name(path)}: sha256 必须是 64 位小写十六进制")
     if type(download["size"]) is not int or not 1 <= download["size"] <= MAXIMUM_PACKAGE_BYTES:
@@ -1240,6 +1908,7 @@ def validate_release(path: Path, file_version: str, plugin: dict) -> dict:
     result = copy.deepcopy(value)
     result.pop("$schema", None)
     result.pop("schemaVersion", None)
+    result["generation"] = generation
     return result
 
 
@@ -1257,50 +1926,224 @@ def load_catalog() -> list[dict]:
         raise ValidationFailure(f"插件总数不能超过 {MAXIMUM_PLUGIN_COUNT}")
     result: list[dict] = []
     seen_ids: set[str] = set()
+    seen_bound_repository_ids: dict[int, str] = {}
+    seen_lineages: set[str] = {
+        item["lineageId"] for item in load_purge_tombstones()
+    }
+    legacy_schema = repository_schema_version() < 2
+    legacy_plugin_list_exists = (ROOT / "plugins.json").exists()
+    legacy_listings = (
+        {item["id"]: item for item in load_plugin_list()}
+        if legacy_schema and legacy_plugin_list_exists
+        else {}
+    )
     for directory in plugin_directories:
         if directory.is_symlink():
             raise ValidationFailure(f"plugins/{directory.name}: 插件目录不能是符号链接")
         unexpected = {
-            item.name for item in directory.iterdir() if item.name not in {"plugin.json", "releases"}
+            item.name
+            for item in directory.iterdir()
+            if item.name not in {"generations", "identity.json", "plugin.json", "releases"}
         }
         if unexpected:
             raise ValidationFailure(
                 f"plugins/{directory.name}: 包含未知中心历史条目 {sorted(unexpected)}"
             )
         plugin_path = directory / "plugin.json"
-        if not plugin_path.is_file() or plugin_path.is_symlink():
-            raise ValidationFailure(f"plugins/{directory.name}: 缺少 plugin.json")
-        plugin = validate_plugin(plugin_path, directory.name)
+        identity_path = directory / "identity.json"
+        if not identity_path.is_file() or identity_path.is_symlink():
+            if not legacy_schema:
+                raise ValidationFailure(f"plugins/{directory.name}: 缺少 identity.json")
+            legacy_listing = legacy_listings.get(directory.name)
+            legacy_plugin = validate_plugin(plugin_path, directory.name)
+            if legacy_listing is None:
+                digest = hashlib.sha256(
+                    legacy_plugin["repositoryUrl"].encode("utf-8")
+                ).digest()
+                repository_id = int.from_bytes(digest[:8], "big") % (2**63 - 1) or 1
+                owner_id = int.from_bytes(digest[8:16], "big") % (2**63 - 1) or 1
+                lifecycle_status = "retired" if legacy_plugin_list_exists else "active"
+            else:
+                repository_id = legacy_listing["repositoryId"]
+                owner_id = legacy_listing["ownerId"]
+                lifecycle_status = "active"
+            identity = {
+                "id": directory.name,
+                "lineageId": str(
+                    uuid.uuid5(
+                        LINEAGE_NAMESPACE,
+                        f"{directory.name}:{repository_id}",
+                    )
+                ),
+                "generation": 1,
+                "lifecycleStatus": lifecycle_status,
+                "generations": [
+                    {
+                        "generation": 1,
+                        "repositoryUrl": legacy_plugin["repositoryUrl"],
+                        "repositoryUrlHistory": [legacy_plugin["repositoryUrl"]],
+                        "repositoryId": repository_id,
+                        "ownerId": owner_id,
+                        "status": lifecycle_status,
+                    }
+                ],
+            }
+        else:
+            identity = validate_plugin_identity(identity_path, directory.name)
+        for binding in identity["generations"]:
+            previous_plugin_id = seen_bound_repository_ids.get(binding["repositoryId"])
+            if previous_plugin_id is not None:
+                raise ValidationFailure(
+                    f"plugins/{directory.name}: repositoryId {binding['repositoryId']} "
+                    f"已永久绑定 {previous_plugin_id}"
+                )
+            seen_bound_repository_ids[binding["repositoryId"]] = directory.name
+        if identity["lineageId"] in seen_lineages:
+            raise ValidationFailure(
+                f"plugins/{directory.name}: lineageId 已被其他插件或 purge 墓碑占用"
+            )
+        seen_lineages.add(identity["lineageId"])
+        generation_plugins: dict[int, dict] = {}
+        generation_release_roots: dict[int, Path] = {}
+        for binding in identity["generations"]:
+            generation = binding["generation"]
+            if generation == 1:
+                generation_root = directory
+            else:
+                generation_root = directory / "generations" / f"g{generation}"
+                if not generation_root.is_dir() or generation_root.is_symlink():
+                    raise ValidationFailure(
+                        f"plugins/{directory.name}: 缺少 generations/g{generation}"
+                    )
+                unexpected_generation = {
+                    item.name
+                    for item in generation_root.iterdir()
+                    if item.name not in {"plugin.json", "releases"}
+                }
+                if unexpected_generation:
+                    raise ValidationFailure(
+                        f"{source_name(generation_root)}: 包含未知条目 "
+                        f"{sorted(unexpected_generation)}"
+                    )
+            plugin_path = generation_root / "plugin.json"
+            if not plugin_path.is_file() or plugin_path.is_symlink():
+                raise ValidationFailure(
+                    f"{source_name(generation_root)}: 缺少 plugin.json"
+                )
+            generation_plugin = validate_plugin(plugin_path, directory.name)
+            if generation_plugin["repositoryUrl"] != binding["repositoryUrl"]:
+                raise ValidationFailure(
+                    f"{source_name(plugin_path)}: repositoryUrl 必须与该代当前 canonical URL 完全一致"
+                )
+            releases_root = generation_root / "releases"
+            if not releases_root.is_dir() or releases_root.is_symlink():
+                raise ValidationFailure(f"{source_name(generation_root)}: 缺少 releases 目录")
+            generation_plugins[generation] = generation_plugin
+            generation_release_roots[generation] = releases_root
+
+        generations_root = directory / "generations"
+        if generations_root.exists():
+            if not generations_root.is_dir() or generations_root.is_symlink():
+                raise ValidationFailure(f"{source_name(generations_root)}: 必须是普通目录")
+            expected_generation_names = {
+                f"g{item['generation']}"
+                for item in identity["generations"]
+                if item["generation"] > 1
+            }
+            actual_generation_names = {item.name for item in generations_root.iterdir()}
+            if actual_generation_names != expected_generation_names:
+                raise ValidationFailure(
+                    f"{source_name(generations_root)}: 代际目录必须与 identity.json 完全一致"
+                )
+
+        current_generation = identity["generation"]
+        current_binding = identity["generations"][-1]
+        plugin = copy.deepcopy(generation_plugins[current_generation])
         if plugin["id"].casefold() in seen_ids:
             raise ValidationFailure(f"plugins/{directory.name}: 插件 ID 重复")
         seen_ids.add(plugin["id"].casefold())
-        releases_root = directory / "releases"
-        if not releases_root.is_dir() or releases_root.is_symlink():
-            raise ValidationFailure(f"plugins/{directory.name}: 缺少 releases 目录")
-        for item in releases_root.iterdir():
-            if not item.is_file() or item.is_symlink() or item.suffix != ".json":
-                raise ValidationFailure(
-                    f"{source_name(item)}: releases 目录只能包含普通 JSON 文件"
-                )
-        release_files = list(releases_root.glob("*.json"))
+        release_files: list[tuple[Path, int]] = []
+        for generation, releases_root in generation_release_roots.items():
+            for item in releases_root.iterdir():
+                if not item.is_file() or item.is_symlink() or item.suffix != ".json":
+                    raise ValidationFailure(
+                        f"{source_name(item)}: releases 目录只能包含普通 JSON 文件"
+                    )
+                release_files.append((item, generation))
         if not release_files:
             raise ValidationFailure(f"plugins/{directory.name}: 至少需要一个历史版本")
         if len(release_files) > MAXIMUM_RELEASE_COUNT:
             raise ValidationFailure(
                 f"plugins/{directory.name}: 版本数不能超过 {MAXIMUM_RELEASE_COUNT}"
             )
-        for path in release_files:
+        for path, _ in release_files:
             if match_semver(path.stem) is None:
                 raise ValidationFailure(f"{source_name(path)}: 文件名必须是严格 SemVer")
-        precedence = [semver_key(path.stem) for path in release_files]
+        precedence = [
+            (generation, semver_key(path.stem)) for path, generation in release_files
+        ]
         if len(set(precedence)) != len(precedence):
             raise ValidationFailure(
-                f"plugins/{directory.name}: 不能收录仅构建元数据不同、优先级相同的版本"
+                f"plugins/{directory.name}: 同一代不能收录优先级相同的版本"
             )
-        release_files.sort(key=lambda path: (semver_key(path.stem), path.stem), reverse=True)
-        plugin["releases"] = [
-            validate_release(path, path.stem, plugin) for path in release_files
-        ]
+        release_files.sort(
+            key=lambda item: (item[1], semver_key(item[0].stem), item[0].stem),
+            reverse=True,
+        )
+        releases: list[dict] = []
+        for path, path_generation in release_files:
+            release = validate_release(
+                path,
+                path.stem,
+                generation_plugins[path_generation],
+                identity,
+            )
+            if release["generation"] != path_generation:
+                raise ValidationFailure(
+                    f"{source_name(path)}: generation 必须与 releases 路径一致"
+                )
+            releases.append(release)
+        if any(
+            not release["yanked"] and release["generation"] != current_generation
+            for release in releases
+        ):
+            raise ValidationFailure(
+                f"plugins/{directory.name}: 非当前 generation 的版本必须全部撤回"
+            )
+        current_usable = any(
+            not release["yanked"] and release["generation"] == current_generation
+            for release in releases
+        )
+        if identity["lifecycleStatus"] in {"retired", "transferred"} and current_usable:
+            raise ValidationFailure(
+                f"plugins/{directory.name}: retired/transferred 插件不能有当前代可用版本"
+            )
+        plugin.update(
+            {
+                "lineageId": identity["lineageId"],
+                "generation": current_generation,
+                "lifecycleStatus": identity["lifecycleStatus"],
+                "visibility": (
+                    "listed"
+                    if identity["lifecycleStatus"] == "active" and current_usable
+                    else "hidden"
+                ),
+                "publisher": {
+                    "repositoryId": current_binding["repositoryId"],
+                    "ownerId": current_binding["ownerId"],
+                },
+                "generations": copy.deepcopy(identity["generations"]),
+                "lifecycleEvents": copy.deepcopy(identity.get("events", [])),
+                "generationMetadata": [
+                    {
+                        "generation": generation,
+                        **copy.deepcopy(metadata),
+                    }
+                    for generation, metadata in sorted(generation_plugins.items())
+                ],
+                "releases": releases,
+            }
+        )
         result.append(plugin)
     return result
 
@@ -1311,6 +2154,8 @@ def validate_review(
     expected_version: str,
     expected_sha256: str,
     trusted_reviewers: set[str],
+    expected_generation: int = 1,
+    trusted_reviewer_ids: dict[str, int] | None = None,
 ) -> dict:
     value = load_object(path)
     require_exact_keys(
@@ -1327,11 +2172,16 @@ def validate_review(
             "lastCommandAt",
             "lastCommentId",
         },
-        {"$schema", "notes"},
+        {"$schema", "generation", "stateById", "notes"},
     )
     validate_schema_reference(path, value)
     if type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1:
         raise ValidationFailure(f"{source_name(path)}: schemaVersion 必须是 1")
+    if repository_schema_version() >= 2 and "generation" not in value:
+        raise ValidationFailure(f"{source_name(path)}: schema v2 审核必须绑定 generation")
+    generation = value.get("generation", 1)
+    if type(generation) is not int or generation != expected_generation:
+        raise ValidationFailure(f"{source_name(path)}: generation 与审核路径不一致")
     plugin_id = require_text(path, "pluginId", value["pluginId"], 128)
     if plugin_id != expected_plugin_id or PLUGIN_ID.fullmatch(plugin_id) is None:
         raise ValidationFailure(f"{source_name(path)}: pluginId 与审核目录不一致")
@@ -1347,8 +2197,27 @@ def validate_review(
     if not isinstance(status, str) or status not in {"verified", "revoked"}:
         raise ValidationFailure(f"{source_name(path)}: status 必须是 verified 或 revoked")
     state_by = require_text(path, "stateBy", value["stateBy"], 39)
-    if GITHUB_LOGIN.fullmatch(state_by) is None or state_by.casefold() not in trusted_reviewers:
-        raise ValidationFailure(f"{source_name(path)}: stateBy 不在 trustedReviewers 中")
+    if GITHUB_LOGIN.fullmatch(state_by) is None:
+        raise ValidationFailure(f"{source_name(path)}: stateBy 不是合法 GitHub 用户名")
+    state_by_id = value.get("stateById")
+    if state_by_id is not None and (
+        type(state_by_id) is not int or not 1 <= state_by_id <= 2**63 - 1
+    ):
+        raise ValidationFailure(f"{source_name(path)}: stateById 必须是正 Int64")
+    if repository_schema_version() >= 2 and state_by_id is None:
+        raise ValidationFailure(f"{source_name(path)}: schema v2 必须保留 stateById")
+    if status == "verified":
+        if state_by.casefold() not in trusted_reviewers:
+            raise ValidationFailure(
+                f"{source_name(path)}: verified stateBy 必须仍在 trustedReviewers 中"
+            )
+        if trusted_reviewer_ids is not None and (
+            state_by_id is None
+            or trusted_reviewer_ids.get(state_by.casefold()) != state_by_id
+        ):
+            raise ValidationFailure(
+                f"{source_name(path)}: verified stateById 与当前 reviewer 数字身份不一致"
+            )
     state_at = validate_utc_timestamp(path, "stateAt", value["stateAt"])
     last_command_at = validate_utc_timestamp(
         path, "lastCommandAt", value["lastCommandAt"]
@@ -1362,6 +2231,7 @@ def validate_review(
     if "notes" in value:
         notes = require_text(path, "notes", value["notes"], 4096, allow_empty=True)
     result = {
+        "generation": generation,
         "status": status,
         "sha256": sha256,
         "stateBy": state_by,
@@ -1369,6 +2239,8 @@ def validate_review(
         "lastCommandAt": last_command_at,
         "lastCommentId": last_comment_id,
     }
+    if state_by_id is not None:
+        result["stateById"] = state_by_id
     if notes is not None:
         result["notes"] = notes
     return result
@@ -1389,12 +2261,12 @@ def load_repository_configuration() -> tuple[dict, set[str]]:
             "registryBotLogin",
             "trustedReviewers",
         },
-        {"$schema"},
+        {"$schema", "indexV2Path", "v2MinimumLauncherVersion", "trustedReviewerIds"},
     )
     validate_schema_reference(path, value)
     if (
         type(value["schemaVersion"]) is not int
-        or value["schemaVersion"] != 1
+        or value["schemaVersion"] not in {1, 2}
         or value["indexPath"] != "public/v1/index.json"
     ):
         raise ValidationFailure("repository.json: 不支持的仓库配置")
@@ -1402,6 +2274,17 @@ def load_repository_configuration() -> tuple[dict, set[str]]:
     _, _, source_url = github_repository_parts(path, "sourceUrl", value["sourceUrl"])
     value["sourceUrl"] = source_url
     require_https(path, "launcherUrl", value["launcherUrl"])
+    if value["schemaVersion"] == 2:
+        if value.get("indexV2Path") != "public/v2/index.json":
+            raise ValidationFailure("repository.json: indexV2Path 必须是 public/v2/index.json")
+        validate_semver(
+            path,
+            "v2MinimumLauncherVersion",
+            value.get("v2MinimumLauncherVersion"),
+        )
+    else:
+        value["indexV2Path"] = "public/v2/index.json"
+        value["v2MinimumLauncherVersion"] = "0.1.2-testplug.1"
     bot_login = require_text(path, "registryBotLogin", value["registryBotLogin"], 44)
     if GITHUB_APP_BOT_LOGIN.fullmatch(bot_login) is None:
         raise ValidationFailure("repository.json: registryBotLogin 必须是 GitHub App [bot] 登录名")
@@ -1415,15 +2298,36 @@ def load_repository_configuration() -> tuple[dict, set[str]]:
     )
     if any(GITHUB_LOGIN.fullmatch(item) is None for item in reviewers):
         raise ValidationFailure("repository.json: trustedReviewers 必须包含有效 GitHub 用户名")
+    reviewer_ids = value.get("trustedReviewerIds")
+    if value["schemaVersion"] == 2:
+        if (
+            not isinstance(reviewer_ids, dict)
+            or {item.casefold() for item in reviewer_ids}
+            != {item.casefold() for item in reviewers}
+        ):
+            raise ValidationFailure(
+                "repository.json: trustedReviewerIds 必须与 trustedReviewers 一一对应"
+            )
+        for login, reviewer_id in reviewer_ids.items():
+            if (
+                GITHUB_LOGIN.fullmatch(login) is None
+                or type(reviewer_id) is not int
+                or not 1 <= reviewer_id <= 2**63 - 1
+            ):
+                raise ValidationFailure("repository.json: trustedReviewerIds 包含无效映射")
     return value, {item.casefold() for item in reviewers}
 
 
-def attach_reviews(result_plugins: list[dict], trusted_reviewers: set[str]) -> None:
+def attach_reviews(
+    result_plugins: list[dict],
+    trusted_reviewers: set[str],
+    trusted_reviewer_ids: dict[str, int] | None = None,
+) -> None:
     reviews_root = ROOT / "reviews"
     if not reviews_root.exists():
         return
     releases_by_key = {
-        (plugin["id"], release["version"]): release
+        (plugin["id"], release.get("generation", 1), release["version"]): release
         for plugin in result_plugins
         for release in plugin["releases"]
     }
@@ -1439,14 +2343,39 @@ def attach_reviews(result_plugins: list[dict], trusted_reviewers: set[str]) -> N
             or plugin_id not in plugin_ids
         ):
             raise ValidationFailure(f"reviews/{plugin_id}: 审核目录没有对应的历史插件")
+        review_files: list[tuple[Path, int]] = []
         for item in directory.iterdir():
-            if not item.is_file() or item.is_symlink() or item.suffix != ".json":
-                raise ValidationFailure(f"{source_name(item)}: 审核目录只能包含版本 JSON 文件")
-        for review_path in sorted(directory.glob("*.json"), key=lambda item: item.name):
+            if item.is_symlink():
+                raise ValidationFailure(f"{source_name(item)}: 审核目录不能包含符号链接")
+            if item.is_file():
+                if item.suffix != ".json":
+                    raise ValidationFailure(
+                        f"{source_name(item)}: 审核目录根只允许 gen1 JSON"
+                    )
+                review_files.append((item, 1))
+                continue
+            match = re.fullmatch(r"g([1-9][0-9]*)", item.name) if item.is_dir() else None
+            if (
+                match is None
+                or int(match.group(1)) < 2
+                or int(match.group(1)) > 2**31 - 1
+            ):
+                raise ValidationFailure(f"{source_name(item)}: 审核代际目录必须命名 g2、g3……")
+            generation = int(match.group(1))
+            for child in item.iterdir():
+                if not child.is_file() or child.is_symlink() or child.suffix != ".json":
+                    raise ValidationFailure(
+                        f"{source_name(child)}: 审核代际目录只能包含普通 JSON"
+                    )
+                review_files.append((child, generation))
+        for review_path, generation in sorted(
+            review_files,
+            key=lambda item: (item[1], item[0].name),
+        ):
             version = review_path.stem
             if match_semver(version) is None:
                 raise ValidationFailure(f"{source_name(review_path)}: 文件名必须是严格 SemVer")
-            release = releases_by_key.get((plugin_id, version))
+            release = releases_by_key.get((plugin_id, generation, version))
             if release is None:
                 raise ValidationFailure(f"{source_name(review_path)}: 没有对应的中心历史版本")
             if "review" in release:
@@ -1457,7 +2386,17 @@ def attach_reviews(result_plugins: list[dict], trusted_reviewers: set[str]) -> N
                 version,
                 release["download"]["sha256"],
                 trusted_reviewers,
+                expected_generation=generation,
+                trusted_reviewer_ids=trusted_reviewer_ids,
             )
+            if (
+                repository_schema_version() >= 2
+                and release["yanked"]
+                and review_record["status"] != "revoked"
+            ):
+                raise ValidationFailure(
+                    f"{source_name(review_path)}: 已撤回版本必须保留 status=revoked 审核墓碑"
+                )
             # Revocation records remain durable ordering tombstones but never
             # enter the launcher contract. A yanked release is likewise never
             # shown as verified.
@@ -1473,10 +2412,49 @@ def attach_reviews(result_plugins: list[dict], trusted_reviewers: set[str]) -> N
                 release["review"] = public_review
 
 
+def project_legacy_catalog(catalog: list[dict]) -> list[dict]:
+    """Remove every v2-only field from the frozen schema-v1 public shape."""
+
+    result: list[dict] = []
+    for plugin in catalog:
+        legacy_plugin = {
+            key: copy.deepcopy(value)
+            for key, value in plugin.items()
+            if key
+            not in {
+                "lineageId",
+                "generation",
+                "lifecycleStatus",
+                "visibility",
+                "publisher",
+                "generations",
+                "lifecycleEvents",
+                "generationMetadata",
+                "releases",
+            }
+        }
+        legacy_plugin["releases"] = [
+            {
+                key: copy.deepcopy(value)
+                for key, value in release.items()
+                if key != "generation"
+            }
+            for release in plugin["releases"]
+        ]
+        result.append(legacy_plugin)
+    return result
+
+
 def build_details() -> list[dict]:
     """Build the review-free generated catalog view from central history."""
 
-    return copy.deepcopy(load_catalog())
+    catalog = copy.deepcopy(load_catalog())
+    if repository_schema_version() >= 2:
+        return catalog
+    # Staged rollout support: infrastructure can land while main still uses
+    # the exact v1 generated-data shape.  The following, one-time migration PR
+    # flips repository.json to v2 and publishes identity-aware views.
+    return project_legacy_catalog(catalog)
 
 
 def validate_active_catalog(listings: list[dict], plugins: list[dict]) -> None:
@@ -1488,6 +2466,44 @@ def validate_active_catalog(listings: list[dict], plugins: list[dict]) -> None:
     if missing:
         raise ValidationFailure(
             f"plugins.json: active 插件缺少中心历史：{', '.join(missing)}；请先执行 --refresh --write"
+        )
+    for plugin_id, plugin in catalog_by_id.items():
+        listing = active_by_id.get(plugin_id)
+        if listing is None:
+            if plugin.get("lifecycleStatus") != "retired":
+                raise ValidationFailure(
+                    f"{plugin_id}: 只有 retired 插件可以从 plugins.json 移除"
+                )
+            if any(not release["yanked"] for release in plugin["releases"]):
+                raise ValidationFailure(f"{plugin_id}: retired 插件必须撤回全部历史版本")
+            continue
+        if plugin.get("lifecycleStatus") == "retired":
+            raise ValidationFailure(f"{plugin_id}: retired 插件不能保留 active 指针")
+        if not same_github_repository(plugin["repositoryUrl"], listing["repositoryUrl"]):
+            raise ValidationFailure(
+                f"{plugin_id}: plugins.json repositoryUrl 与中心历史仓库不一致"
+            )
+        if (
+            plugin.get("lineageId") != listing.get("lineageId")
+            or plugin.get("generation") != listing.get("generation")
+            or plugin.get("publisher", {}).get("repositoryId")
+            != listing.get("repositoryId")
+            or plugin.get("publisher", {}).get("ownerId") != listing.get("ownerId")
+        ):
+            raise ValidationFailure(
+                f"{plugin_id}: plugins.json 必须与 identity.json 当前数字身份完全一致"
+            )
+
+
+def validate_legacy_active_catalog(listings: list[dict], plugins: list[dict]) -> None:
+    """Reproduce the frozen schema-v1 active/archive invariant exactly."""
+
+    active_by_id = {listing["id"]: listing for listing in listings}
+    catalog_by_id = {plugin["id"]: plugin for plugin in plugins}
+    missing = sorted(set(active_by_id) - set(catalog_by_id), key=str.casefold)
+    if missing:
+        raise ValidationFailure(
+            "plugins.json: active 插件缺少中心历史：" + ", ".join(missing)
         )
     for plugin_id, plugin in catalog_by_id.items():
         listing = active_by_id.get(plugin_id)
@@ -1504,12 +2520,68 @@ def validate_active_catalog(listings: list[dict], plugins: list[dict]) -> None:
 
 
 def build_index(plugins: list[dict] | None = None) -> dict:
-    """Build the launcher contract and inject only trusted hash-bound reviews."""
+    """Build the legacy v1 launcher contract without any unknown fields.
+
+    While repository schema is still v1, reproduce the historical generator
+    byte-for-byte, including fully-yanked archive entries.  After the one-time
+    schema2 migration, only an active generation-1 lineage with one URL alias
+    and at least one usable release remains representable in v1.
+    """
 
     repository, trusted_reviewers = load_repository_configuration()
-    result_plugins = copy.deepcopy(load_catalog() if plugins is None else plugins)
-    validate_active_catalog(load_plugin_list(), result_plugins)
-    attach_reviews(result_plugins, trusted_reviewers)
+    catalog = copy.deepcopy(load_catalog() if plugins is None else plugins)
+    if repository["schemaVersion"] < 2:
+        validate_legacy_active_catalog(load_plugin_list(), catalog)
+        catalog = project_legacy_catalog(catalog)
+        reviewer_ids = None
+        attach_reviews(catalog, trusted_reviewers, reviewer_ids)
+        return {
+            "schemaVersion": 1,
+            "name": repository["name"],
+            "sourceUrl": repository["sourceUrl"],
+            "plugins": catalog,
+        }
+    validate_active_catalog(load_plugin_list(), catalog)
+    reviewer_ids = {
+        login.casefold(): reviewer_id
+        for login, reviewer_id in repository.get("trustedReviewerIds", {}).items()
+    }
+    attach_reviews(catalog, trusted_reviewers, reviewer_ids or None)
+    result_plugins: list[dict] = []
+    for plugin in catalog:
+        if (
+            plugin.get("generation") != 1
+            or plugin.get("lifecycleStatus") != "active"
+            or plugin.get("visibility") != "listed"
+            or len(plugin.get("generations", [{}])[0].get("repositoryUrlHistory", []))
+            != 1
+        ):
+            continue
+        generation_one = next(
+            (
+                item
+                for item in plugin.get("generationMetadata", [])
+                if item.get("generation") == 1
+            ),
+            None,
+        )
+        if generation_one is None:
+            raise ValidationFailure(f"{plugin['id']}: 缺少冻结的 generation 1 元数据")
+        releases = [
+            {key: copy.deepcopy(value) for key, value in release.items() if key != "generation"}
+            for release in plugin["releases"]
+            if release.get("generation", 1) == 1
+        ]
+        if not any(not release["yanked"] for release in releases):
+            continue
+        result_plugins.append(
+            {
+                key: copy.deepcopy(value)
+                for key, value in generation_one.items()
+                if key != "generation"
+            }
+            | {"releases": releases}
+        )
     return {
         "schemaVersion": 1,
         "name": repository["name"],
@@ -1518,21 +2590,114 @@ def build_index(plugins: list[dict] | None = None) -> dict:
     }
 
 
-def public_plugin_to_source(plugin: dict) -> dict:
-    body = {key: copy.deepcopy(value) for key, value in plugin.items() if key != "releases"}
+def build_index_v2(plugins: list[dict] | None = None) -> dict:
+    """Build the identity-aware contract with complete yanked history."""
+
+    repository, trusted_reviewers = load_repository_configuration()
+    catalog = copy.deepcopy(load_catalog() if plugins is None else plugins)
+    validate_active_catalog(load_plugin_list(), catalog)
+    reviewer_ids = {
+        login.casefold(): reviewer_id
+        for login, reviewer_id in repository.get("trustedReviewerIds", {}).items()
+    }
+    attach_reviews(catalog, trusted_reviewers, reviewer_ids or None)
+    minimum_v2 = repository["v2MinimumLauncherVersion"]
+    result_plugins: list[dict] = []
+    for plugin in catalog:
+        for release in plugin["releases"]:
+            if release.get("generation", 1) > 1 and semver_key(
+                release["compatibility"]["minimumLauncherVersion"]
+            ) < semver_key(minimum_v2):
+                raise ValidationFailure(
+                    f"{plugin['id']} generation {release['generation']} "
+                    f"{release['version']}: minimumLauncherVersion 必须至少为 {minimum_v2}"
+                )
+        public_plugin = {
+            key: copy.deepcopy(value)
+            for key, value in plugin.items()
+            if key not in {"generationMetadata", "lifecycleEvents"}
+        }
+        public_plugin["generations"] = [
+            {
+                "generation": binding["generation"],
+                "repositoryUrl": binding["repositoryUrl"],
+                "repositoryUrlHistory": copy.deepcopy(
+                    binding["repositoryUrlHistory"]
+                ),
+                "publisher": {
+                    "repositoryId": binding["repositoryId"],
+                    "ownerId": binding["ownerId"],
+                },
+                "status": binding["status"],
+            }
+            for binding in plugin["generations"]
+        ]
+        result_plugins.append(public_plugin)
     return {
-        "$schema": "../../schemas/catalog-plugin-v1.schema.json",
+        "schemaVersion": 2,
+        "name": repository["name"],
+        "sourceUrl": repository["sourceUrl"],
+        "minimumLauncherVersion": minimum_v2,
+        "plugins": result_plugins,
+    }
+
+
+def public_plugin_to_source(plugin: dict, generation: int = 1) -> dict:
+    generated_fields = {
+        "generation",
+        "generationMetadata",
+        "generations",
+        "lifecycleEvents",
+        "lifecycleStatus",
+        "lineageId",
+        "publisher",
+        "releases",
+        "visibility",
+    }
+    body = {
+        key: copy.deepcopy(value)
+        for key, value in plugin.items()
+        if key not in generated_fields
+    }
+    return {
+        "$schema": (
+            "../../schemas/catalog-plugin-v1.schema.json"
+            if generation == 1
+            else "../../../../schemas/catalog-plugin-v1.schema.json"
+        ),
         "schemaVersion": 1,
         **body,
     }
 
 
 def public_release_to_source(release: dict) -> dict:
+    schema_path = (
+        "../../../schemas/catalog-release-v1.schema.json"
+        if release.get("generation", 1) == 1
+        else "../../../../../schemas/catalog-release-v1.schema.json"
+    )
     return {
-        "$schema": "../../../schemas/catalog-release-v1.schema.json",
+        "$schema": schema_path,
         "schemaVersion": 1,
         **copy.deepcopy(release),
     }
+
+
+def catalog_identity_to_source(plugin: dict) -> dict:
+    """Render only the durable identity ledger fields from a catalog plugin."""
+
+    result = {
+        "$schema": "../../schemas/plugin-identity-v1.schema.json",
+        "schemaVersion": 1,
+        "id": plugin["id"],
+        "lineageId": plugin["lineageId"],
+        "generation": plugin["generation"],
+        "lifecycleStatus": plugin["lifecycleStatus"],
+        "generations": copy.deepcopy(plugin["generations"]),
+    }
+    if plugin.get("lifecycleEvents"):
+        result["events"] = copy.deepcopy(plugin["lifecycleEvents"])
+    return result
 
 
 def canonical_json(value: object) -> str:
@@ -1561,7 +2726,7 @@ def ensure_existing_details_history(existing_details: list, catalog: list[dict])
     if not isinstance(existing_details, list):
         raise ValidationFailure("plugin_details.json: JSON 根必须是数组")
     catalog_versions = {
-        (plugin["id"], release["version"])
+        (plugin["id"], release.get("generation", 1), release["version"])
         for plugin in catalog
         for release in plugin["releases"]
     }
@@ -1574,9 +2739,19 @@ def ensure_existing_details_history(existing_details: list, catalog: list[dict])
             raise ValidationFailure("plugin_details.json: 插件历史结构无效")
         for release in releases:
             version = release.get("version") if isinstance(release, dict) else None
-            if not isinstance(version, str) or (plugin_id, version) not in catalog_versions:
+            generation = (
+                release.get("generation", 1)
+                if isinstance(release, dict)
+                else None
+            )
+            if (
+                not isinstance(version, str)
+                or type(generation) is not int
+                or (plugin_id, generation, version) not in catalog_versions
+            ):
                 raise ValidationFailure(
-                    f"plugin_details.json: 历史 {plugin_id} {version!r} 在中心目录中丢失，拒绝静默删除"
+                    f"plugin_details.json: 历史 {plugin_id} g{generation} "
+                    f"{version!r} 在中心目录中丢失，拒绝静默删除"
                 )
 
 
@@ -1588,6 +2763,32 @@ def immutable_release_identity(release: dict) -> dict:
         for key, value in release.items()
         if key not in {"yanked", "yankReason", "review"}
     }
+
+
+def stable_plugin_metadata(plugin: dict) -> dict:
+    """Return publisher metadata, excluding generated identity/lifecycle fields."""
+
+    return {
+        key: copy.deepcopy(plugin[key])
+        for key in (
+            "id",
+            "name",
+            "description",
+            "authors",
+            "repositoryUrl",
+            "maintainers",
+            "categories",
+            "license",
+        )
+    }
+
+
+def immutable_plugin_metadata(plugin: dict) -> dict:
+    """Return same-generation metadata that a repository rename cannot alter."""
+
+    result = stable_plugin_metadata(plugin)
+    result.pop("repositoryUrl", None)
+    return result
 
 
 def verify_new_release_candidate(plugin: dict, release: dict) -> None:
@@ -1608,15 +2809,58 @@ def publisher_missing_releases(
     if existing is None:
         missing_releases = list(releases)
     else:
-        if not same_github_repository(
-            existing["repositoryUrl"], plugin["repositoryUrl"]
+        generation = plugin.get("generation", 1)
+        if generation != existing.get("generation", 1):
+            raise ValidationFailure(
+                f"{plugin['id']}: 发布候选 generation 与当前身份不一致"
+            )
+        if plugin.get("lineageId") != existing.get("lineageId"):
+            raise ValidationFailure(
+                f"{plugin['id']}: 发布候选 lineageId 与中心身份不一致"
+            )
+        bindings = existing.get("generations")
+        current_binding = (
+            bindings[-1]
+            if isinstance(bindings, list) and bindings
+            else {
+                "repositoryUrl": existing["repositoryUrl"],
+                "repositoryUrlHistory": [existing["repositoryUrl"]],
+                "repositoryId": existing.get("publisher", {}).get("repositoryId"),
+                "ownerId": existing.get("publisher", {}).get("ownerId"),
+            }
+        )
+        old_history = current_binding.get(
+            "repositoryUrlHistory", [current_binding.get("repositoryUrl")]
+        )
+        new_history = plugin.get("repositoryUrlHistory", [plugin["repositoryUrl"]])
+        if (
+            not isinstance(old_history, list)
+            or not isinstance(new_history, list)
+            or new_history[: len(old_history)] != old_history
+            or not new_history
+            or new_history[-1] != plugin["repositoryUrl"]
         ):
             raise ValidationFailure(
-                f"{plugin['id']}: plugins.json 不能把已收录 ID 转移到另一个仓库"
+                f"{plugin['id']}: repositoryUrlHistory 只能保留旧前缀并追加当前 canonical URL"
+            )
+        numeric_identity_required = (
+            repository_schema_version() >= 2
+            or "publisher" in plugin
+        )
+        if numeric_identity_required and (
+            plugin.get("publisher") != existing.get("publisher")
+            or current_binding.get("repositoryId")
+            != existing.get("publisher", {}).get("repositoryId")
+            or current_binding.get("ownerId")
+            != existing.get("publisher", {}).get("ownerId")
+        ):
+            raise ValidationFailure(
+                f"{plugin['id']}: 同代 URL 重命名必须保持 repositoryId 与 ownerId"
             )
         publisher_by_version = {release["version"]: release for release in releases}
         central_by_version = {
             release["version"]: release for release in existing["releases"]
+            if release.get("generation", 1) == generation
         }
         missing = sorted(
             set(central_by_version) - set(publisher_by_version),
@@ -1638,30 +2882,29 @@ def publisher_missing_releases(
             for release in releases
             if release["version"] not in central_by_version
         ]
-        current_plugin = {
-            key: value for key, value in existing.items() if key != "releases"
-        }
-        if current_plugin != plugin:
+        if immutable_plugin_metadata(existing) != immutable_plugin_metadata(plugin):
             raise ValidationFailure(
-                f"{plugin['id']}: 顶层稳定插件元数据在首次收录后不可修改"
+                f"{plugin['id']}: 除已验证仓库重命名外，当前 generation 的稳定插件元数据不可修改"
             )
-        if not any(not release["yanked"] for release in existing["releases"]):
+        if not any(not release["yanked"] for release in central_by_version.values()):
             if not missing_releases:
                 raise ValidationFailure(
                     f"{plugin['id']}: active 插件历史已全部撤回，应发布新版本或从 plugins.json 归档"
                 )
-            highest_historical = max(
-                existing["releases"], key=lambda item: semver_key(item["version"])
-            )
-            if not any(
-                semver_key(release["version"])
-                > semver_key(highest_historical["version"])
-                for release in missing_releases
-            ):
-                raise ValidationFailure(
-                    f"{plugin['id']}: 全部历史已撤回，重新激活必须发布高于历史最高版本 "
-                    f"{highest_historical['version']} 的新版本"
+            if central_by_version:
+                highest_historical = max(
+                    central_by_version.values(),
+                    key=lambda item: semver_key(item["version"]),
                 )
+                if not any(
+                    semver_key(release["version"])
+                    > semver_key(highest_historical["version"])
+                    for release in missing_releases
+                ):
+                    raise ValidationFailure(
+                        f"{plugin['id']}: 同代重新激活必须发布高于该代历史最高版本 "
+                        f"{highest_historical['version']} 的新版本"
+                    )
 
     return missing_releases
 
@@ -1716,9 +2959,75 @@ def merge_publisher_snapshot(
 ) -> tuple[dict | None, list[dict]]:
     """Fetch and atomically merge one publisher's complete release history."""
 
-    remote = fetch_publisher_manifest(listing)
-    plugin, releases = validate_publisher_manifest_releases(remote, listing)
-    existing = by_id.get(plugin["id"])
+    existing = by_id.get(listing["id"])
+    effective_listing = copy.deepcopy(listing)
+    repository_url_history = [listing["repositoryUrl"]]
+    if existing is not None:
+        bindings = existing.get("generations")
+        current_binding = (
+            bindings[-1]
+            if isinstance(bindings, list) and bindings
+            else {
+                "repositoryUrl": existing["repositoryUrl"],
+                "repositoryUrlHistory": [existing["repositoryUrl"]],
+                "repositoryId": existing.get("publisher", {}).get("repositoryId"),
+                "ownerId": existing.get("publisher", {}).get("ownerId"),
+            }
+        )
+        repository_url_history = copy.deepcopy(
+            current_binding.get(
+                "repositoryUrlHistory", [current_binding["repositoryUrl"]]
+            )
+        )
+        if listing["repositoryUrl"] != current_binding["repositoryUrl"]:
+            if (
+                listing["repositoryUrl"].casefold()
+                == current_binding["repositoryUrl"].casefold()
+            ):
+                effective_listing["repositoryUrl"] = current_binding["repositoryUrl"]
+                listing = effective_listing
+            elif (
+                listing.get("repositoryId") != current_binding.get("repositoryId")
+                or listing.get("ownerId") != current_binding.get("ownerId")
+            ):
+                raise ValidationFailure(
+                    f"{listing['id']}: 仓库 canonical URL 变化时必须保持 repositoryId 与 ownerId"
+                )
+            elif listing["repositoryUrl"].casefold() in {
+                item.casefold() for item in repository_url_history
+            }:
+                raise ValidationFailure(
+                    f"{listing['id']}: repositoryUrlHistory 不允许循环或重复地址"
+                )
+            else:
+                repository_url_history.append(listing["repositoryUrl"])
+        effective_listing["repositoryUrlHistory"] = repository_url_history
+
+    remote = fetch_publisher_manifest(effective_listing)
+    plugin, releases = validate_publisher_manifest_releases(
+        remote, effective_listing
+    )
+    generation = listing.get("generation", 1)
+    lineage_id = listing.get("lineageId")
+    plugin["generation"] = generation
+    plugin["lineageId"] = lineage_id
+    repository_id = listing.get("repositoryId")
+    owner_id = listing.get("ownerId")
+    if type(repository_id) is int and type(owner_id) is int:
+        plugin["publisher"] = {
+            "repositoryId": repository_id,
+            "ownerId": owner_id,
+        }
+    plugin["repositoryUrlHistory"] = repository_url_history
+    for release in releases:
+        release["generation"] = generation
+    if existing is not None and lineage_id is None:
+        lineage_id = existing.get("lineageId")
+        plugin["lineageId"] = lineage_id
+        generation = existing.get("generation", generation)
+        plugin["generation"] = generation
+        for release in releases:
+            release["generation"] = generation
     candidates = plan_publisher_candidates(
         plugin,
         releases,
@@ -1726,7 +3035,11 @@ def merge_publisher_snapshot(
         maximum_candidates=maximum_candidates,
         maximum_candidate_bytes=maximum_candidate_bytes,
     )
-    if not candidates:
+    repository_was_renamed = bool(
+        existing is not None
+        and plugin["repositoryUrl"] != existing["repositoryUrl"]
+    )
+    if not candidates and not repository_was_renamed:
         return None, []
 
     # Verify every missing ZIP before mutating even the in-memory central view.
@@ -1748,15 +3061,62 @@ def merge_publisher_snapshot(
 
     if existing is None:
         merged = copy.deepcopy(plugin)
+        if (
+            generation != 1
+            or LINEAGE_ID.fullmatch(str(lineage_id or "")) is None
+            or type(repository_id) is not int
+            or type(owner_id) is not int
+        ):
+            raise ValidationFailure(
+                f"{plugin['id']}: 首次收录缺少完整 lineage 与 GitHub numeric identity"
+            )
+        merged.update(
+            {
+                "lifecycleStatus": "active",
+                "visibility": "listed",
+                "publisher": {
+                    "repositoryId": repository_id,
+                    "ownerId": owner_id,
+                },
+                "generations": [
+                    {
+                        "generation": generation,
+                        "repositoryUrl": plugin["repositoryUrl"],
+                        "repositoryUrlHistory": [plugin["repositoryUrl"]],
+                        "repositoryId": repository_id,
+                        "ownerId": owner_id,
+                        "status": "active",
+                    }
+                ],
+                "generationMetadata": [
+                    {"generation": generation, **copy.deepcopy(stable_plugin_metadata(plugin))}
+                ],
+            }
+        )
         merged["releases"] = copy.deepcopy(candidates)
         by_id[plugin["id"]] = merged
     else:
-        existing.update(copy.deepcopy(plugin))
+        existing.update(copy.deepcopy(stable_plugin_metadata(plugin)))
+        existing["generations"][-1]["repositoryUrl"] = plugin["repositoryUrl"]
+        existing["generations"][-1]["repositoryUrlHistory"] = copy.deepcopy(
+            repository_url_history
+        )
+        for metadata in existing.get("generationMetadata", []):
+            if metadata.get("generation") == generation:
+                metadata["repositoryUrl"] = plugin["repositoryUrl"]
         existing["releases"].extend(copy.deepcopy(candidates))
         existing["releases"].sort(
-            key=lambda item: (semver_key(item["version"]), item["version"]),
+            key=lambda item: (
+                item.get("generation", 1),
+                semver_key(item["version"]),
+                item["version"],
+            ),
             reverse=True,
         )
+        existing["lifecycleStatus"] = "active"
+        existing["visibility"] = "listed"
+        existing["generations"][-1]["status"] = "active"
+    plugin.pop("repositoryUrlHistory", None)
     return plugin, candidates
 
 
@@ -1850,7 +3210,7 @@ def refresh_details(
     ensure_existing_details_history(existing_details, catalog)
     by_id = {plugin["id"]: copy.deepcopy(plugin) for plugin in catalog}
     pending_plugins: dict[str, dict] = {}
-    pending_releases: dict[tuple[str, str], dict] = {}
+    pending_releases: dict[tuple[str, int, str], dict] = {}
     remaining_candidates = MAXIMUM_NEW_RELEASE_COUNT
     remaining_candidate_bytes = MAXIMUM_NEW_RELEASE_BYTES
     catalog_ids = {plugin["id"].casefold() for plugin in catalog}
@@ -1944,7 +3304,7 @@ def refresh_details(
                 warnings.append(message)
             emit_refresh_warning(message)
             continue
-        if plugin is not None and releases:
+        if plugin is not None:
             used_candidates = len(releases)
             used_bytes = sum(release["download"]["size"] for release in releases)
             if (
@@ -1959,9 +3319,12 @@ def refresh_details(
             if reserve_for_active and is_discovery:
                 discovery_candidates -= used_candidates
                 discovery_candidate_bytes -= used_bytes
-            pending_plugins[plugin["id"]] = plugin
+            pending_plugins[plugin["id"]] = copy.deepcopy(by_id[plugin["id"]])
             for release in releases:
-                pending_releases[(plugin["id"], release["version"])] = release
+                release.setdefault("generation", plugin.get("generation", 1))
+                pending_releases[
+                    (plugin["id"], release["generation"], release["version"])
+                ] = release
     result = sorted(by_id.values(), key=lambda item: item["id"].casefold())
     if len(result) > MAXIMUM_PLUGIN_COUNT:
         raise ValidationFailure(
@@ -1969,20 +3332,41 @@ def refresh_details(
         )
     if write:
         for plugin_id in sorted(pending_plugins, key=str.casefold):
-            path = ROOT / "plugins" / plugin_id / "plugin.json"
-            write_text_atomic(
-                path, canonical_json(public_plugin_to_source(pending_plugins[plugin_id]))
+            pending = pending_plugins[plugin_id]
+            generation = pending["generation"]
+            generation_root = (
+                ROOT / "plugins" / plugin_id
+                if generation == 1
+                else ROOT / "plugins" / plugin_id / "generations" / f"g{generation}"
             )
-        for plugin_id, version in sorted(
+            path = generation_root / "plugin.json"
+            write_text_atomic(
+                path, canonical_json(public_plugin_to_source(pending, generation))
+            )
+            identity_path = ROOT / "plugins" / plugin_id / "identity.json"
+            write_text_atomic(
+                identity_path,
+                canonical_json(catalog_identity_to_source(pending)),
+            )
+        for plugin_id, generation, version in sorted(
             pending_releases,
-            key=lambda item: (item[0].casefold(), semver_key(item[1])),
+            key=lambda item: (item[0].casefold(), item[1], semver_key(item[2])),
         ):
-            path = ROOT / "plugins" / plugin_id / "releases" / f"{version}.json"
+            generation_root = (
+                ROOT / "plugins" / plugin_id
+                if generation == 1
+                else ROOT / "plugins" / plugin_id / "generations" / f"g{generation}"
+            )
+            path = generation_root / "releases" / f"{version}.json"
             if path.exists():
                 raise ValidationFailure(f"{source_name(path)}: 历史文件已存在，拒绝覆盖")
             write_text_atomic(
                 path,
-                canonical_json(public_release_to_source(pending_releases[(plugin_id, version)])),
+                canonical_json(
+                    public_release_to_source(
+                        pending_releases[(plugin_id, generation, version)]
+                    )
+                ),
             )
     return result
 
@@ -2833,6 +4217,7 @@ def render(value: object) -> str:
 
 
 def main() -> int:
+    global ROOT
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--refresh",
@@ -2851,9 +4236,19 @@ def main() -> int:
         action="store_true",
         help="isolate publisher/history availability failures and emit warnings",
     )
+    parser.add_argument(
+        "--registry-root",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     try:
+        if args.registry_root is not None:
+            ROOT = args.registry_root.resolve()
+            if not (ROOT / "repository.json").is_file():
+                raise ValidationFailure("--registry-root 不是插件中心 worktree")
         refresh_warnings: list[str] = []
+        validate_bootstrap_anchor()
         listings = load_plugin_list()
         # The version directories, not plugin_details.json, are authoritative.
         # Passing their generated view also lets --write repair a missing or
@@ -2871,14 +4266,20 @@ def main() -> int:
                 details = build_details()
         else:
             details = existing_details
+        schema_v2_enabled = repository_schema_version() >= 2
         index = build_index(details)
+        index_v2 = build_index_v2(details) if schema_v2_enabled else None
         rendered_details = render(details)
         rendered_index = render(index)
+        rendered_index_v2 = render(index_v2) if index_v2 is not None else None
         details_path = ROOT / "plugin_details.json"
         index_path = ROOT / "public/v1/index.json"
+        index_v2_path = ROOT / "public/v2/index.json"
         if args.write:
             write_text_atomic(details_path, rendered_details)
             write_text_atomic(index_path, rendered_index)
+            if rendered_index_v2 is not None:
+                write_text_atomic(index_v2_path, rendered_index_v2)
         if args.check:
             current_details = (
                 details_path.read_text(encoding="utf-8") if details_path.exists() else ""
@@ -2892,9 +4293,20 @@ def main() -> int:
                 raise ValidationFailure(
                     "public/v1/index.json 不是由中心历史与审核确定性生成的，请运行 python tools/validate.py --write"
                 )
+            if rendered_index_v2 is not None:
+                current_index_v2 = (
+                    index_v2_path.read_text(encoding="utf-8")
+                    if index_v2_path.exists()
+                    else ""
+                )
+                if current_index_v2 != rendered_index_v2:
+                    raise ValidationFailure(
+                        "public/v2/index.json 不是由中心历史、身份与审核确定性生成的，"
+                        "请运行 python tools/validate.py --write"
+                    )
         if args.verify_assets:
             verify_assets(
-                index,
+                index_v2 if index_v2 is not None else index,
                 best_effort=args.best_effort,
                 warnings=refresh_warnings,
             )
