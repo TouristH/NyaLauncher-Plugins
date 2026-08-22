@@ -1,0 +1,24 @@
+{
+  "$schema": "../../../schemas/catalog-release-v1.schema.json",
+  "schemaVersion": 1,
+  "version": "1.0.0",
+  "channel": "stable",
+  "publishedAt": "2026-08-20T19:34:00Z",
+  "releaseNotesUrl": "https://github.com/TouristH/NyaLauncher.Clock/releases/tag/v1.0.0",
+  "download": {
+    "url": "https://github.com/TouristH/NyaLauncher.Clock/releases/download/v1.0.0/io.github.touristh.example-clock-1.0.0.zip",
+    "sha256": "6ed02d5a11096efd625ea1bc92e8e8d9991620854ed203246e05c7c84cdb7f1a",
+    "size": 14185
+  },
+  "compatibility": {
+    "manifestVersion": 1,
+    "apiVersion": "1.0",
+    "minimumLauncherVersion": "0.1.1"
+  },
+  "requiredCapabilities": [
+    "ui.components",
+    "system.info.read"
+  ],
+  "optionalCapabilities": [],
+  "yanked": false
+}
