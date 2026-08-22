@@ -1,12 +1,19 @@
 {
-  "$schema": "./schemas/repository-v1.schema.json",
-  "schemaVersion": 1,
+  "$schema": "./schemas/repository-v2.schema.json",
+  "schemaVersion": 2,
   "name": "NyaLauncher Plugins",
   "sourceUrl": "https://github.com/TouristH/NyaLauncher-Plugins",
   "launcherUrl": "https://github.com/redstore-noob/NyaLauncher",
   "indexPath": "public/v1/index.json",
+  "indexV2Path": "public/v2/index.json",
+  "v2MinimumLauncherVersion": "0.1.2-testplug.1",
   "registryBotLogin": "nyalauncher-registry-bot[bot]",
   "trustedReviewers": [
-    "TouristH"
-  ]
+    "TouristH",
+    "redstore-noob"
+  ],
+  "trustedReviewerIds": {
+    "TouristH": 143396778,
+    "redstore-noob": 206107690
+  }
 }

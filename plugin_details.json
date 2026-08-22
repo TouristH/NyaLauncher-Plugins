@@ -14,8 +14,49 @@
       "utilities"
     ],
     "license": "MIT",
+    "lineageId": "dc538577-8d88-50e4-ba9e-10620bc5ba10",
+    "generation": 1,
+    "lifecycleStatus": "retired",
+    "visibility": "hidden",
+    "publisher": {
+      "repositoryId": 1317097635,
+      "ownerId": 206107690
+    },
+    "generations": [
+      {
+        "generation": 1,
+        "repositoryUrl": "https://github.com/redstore-noob/NyaLauncher",
+        "repositoryUrlHistory": [
+          "https://github.com/redstore-noob/NyaLauncher"
+        ],
+        "repositoryId": 1317097635,
+        "ownerId": 206107690,
+        "status": "retired"
+      }
+    ],
+    "lifecycleEvents": [],
+    "generationMetadata": [
+      {
+        "generation": 1,
+        "id": "io.github.touristh.clock",
+        "name": "电子时钟示例",
+        "description": "显示当前电脑时间的电子钟组件，可切换 24/12 小时制并控制时区和秒的显示。",
+        "authors": [
+          "TouristH"
+        ],
+        "repositoryUrl": "https://github.com/redstore-noob/NyaLauncher",
+        "maintainers": [
+          "TouristH"
+        ],
+        "categories": [
+          "utilities"
+        ],
+        "license": "MIT"
+      }
+    ],
     "releases": [
       {
+        "generation": 1,
         "version": "1.1.0",
         "channel": "stable",
         "publishedAt": "2026-08-13T12:28:11Z",
@@ -39,6 +80,7 @@
         "yankReason": "固定 GitHub Release ZIP 资产不存在（HTTP 404，2026-08-20 确认）。"
       },
       {
+        "generation": 1,
         "version": "1.0.0",
         "channel": "stable",
         "publishedAt": "2026-08-13T11:59:52Z",
@@ -78,8 +120,49 @@
       "utilities"
     ],
     "license": "MIT",
+    "lineageId": "9d0f81a3-4f25-5699-ac57-ece4c106e045",
+    "generation": 1,
+    "lifecycleStatus": "active",
+    "visibility": "listed",
+    "publisher": {
+      "repositoryId": 1341064957,
+      "ownerId": 143396778
+    },
+    "generations": [
+      {
+        "generation": 1,
+        "repositoryUrl": "https://github.com/TouristH/NyaLauncher.Clock",
+        "repositoryUrlHistory": [
+          "https://github.com/TouristH/NyaLauncher.Clock"
+        ],
+        "repositoryId": 1341064957,
+        "ownerId": 143396778,
+        "status": "active"
+      }
+    ],
+    "lifecycleEvents": [],
+    "generationMetadata": [
+      {
+        "generation": 1,
+        "id": "io.github.touristh.example-clock",
+        "name": "电子时钟示例",
+        "description": "显示当前电脑时间的电子钟组件，可切换 24/12 小时制并控制时区和秒的显示。",
+        "authors": [
+          "TouristH"
+        ],
+        "repositoryUrl": "https://github.com/TouristH/NyaLauncher.Clock",
+        "maintainers": [
+          "TouristH"
+        ],
+        "categories": [
+          "utilities"
+        ],
+        "license": "MIT"
+      }
+    ],
     "releases": [
       {
+        "generation": 1,
         "version": "1.0.0",
         "channel": "stable",
         "publishedAt": "2026-08-20T19:34:00Z",
