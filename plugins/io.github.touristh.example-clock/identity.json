@@ -1,0 +1,20 @@
+{
+  "$schema": "../../schemas/plugin-identity-v1.schema.json",
+  "schemaVersion": 1,
+  "id": "io.github.touristh.example-clock",
+  "lineageId": "9d0f81a3-4f25-5699-ac57-ece4c106e045",
+  "generation": 1,
+  "lifecycleStatus": "active",
+  "generations": [
+    {
+      "generation": 1,
+      "repositoryUrl": "https://github.com/TouristH/NyaLauncher.Clock",
+      "repositoryUrlHistory": [
+        "https://github.com/TouristH/NyaLauncher.Clock"
+      ],
+      "repositoryId": 1341064957,
+      "ownerId": 143396778,
+      "status": "active"
+    }
+  ]
+}

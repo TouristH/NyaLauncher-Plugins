@@ -1,0 +1,20 @@
+{
+  "$schema": "../../schemas/plugin-identity-v1.schema.json",
+  "schemaVersion": 1,
+  "id": "io.github.touristh.clock",
+  "lineageId": "dc538577-8d88-50e4-ba9e-10620bc5ba10",
+  "generation": 1,
+  "lifecycleStatus": "retired",
+  "generations": [
+    {
+      "generation": 1,
+      "repositoryUrl": "https://github.com/redstore-noob/NyaLauncher",
+      "repositoryUrlHistory": [
+        "https://github.com/redstore-noob/NyaLauncher"
+      ],
+      "repositoryId": 1317097635,
+      "ownerId": 206107690,
+      "status": "retired"
+    }
+  ]
+}
