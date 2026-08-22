@@ -11,6 +11,14 @@ body:
     validations:
       required: true
   - type: input
+    id: generation
+    attributes:
+      label: 代际 / Generation
+      description: 首次发布为 1；转让后的新发布者使用 2、3……
+      placeholder: "1"
+    validations:
+      required: true
+  - type: input
     id: versions
     attributes:
       label: 版本 / Versions

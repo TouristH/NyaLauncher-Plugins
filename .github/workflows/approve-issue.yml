@@ -23,6 +23,10 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Fail closed until the identity migration is complete
+        run: >-
+          jq -e '.schemaVersion == 2' repository.json >/dev/null ||
+          (echo '::notice::Registry v2 migration is pending; yank writes are disabled' && exit 78)
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -39,7 +43,7 @@ jobs:
     timeout-minutes: 45
     concurrency:
       group: registry-write
-      queue: max
+      cancel-in-progress: false
     permissions:
       contents: read
       issues: write
@@ -81,7 +85,8 @@ jobs:
       - name: Stage only yank data
         id: changes
         run: |
-          git add -- plugins.json plugins reviews plugin_details.json public/v1/index.json
+          git add -- plugins.json plugins reviews plugin_details.json \
+            public/v1/index.json public/v2/index.json
           git diff --cached --check
           if git diff --cached --quiet; then
             echo "The yank is already reflected in main"
@@ -194,6 +199,10 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Fail closed until the identity migration is complete
+        run: >-
+          jq -e '.schemaVersion == 2' repository.json >/dev/null ||
+          (echo '::notice::Registry v2 migration is pending; issue rejection is disabled' && exit 78)
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -210,7 +219,7 @@ jobs:
     timeout-minutes: 10
     concurrency:
       group: registry-write
-      queue: max
+      cancel-in-progress: false
     permissions:
       contents: read
       issues: write

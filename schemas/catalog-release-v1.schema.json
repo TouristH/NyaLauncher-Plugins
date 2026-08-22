@@ -6,6 +6,7 @@
   "additionalProperties": false,
   "required": [
     "schemaVersion",
+    "generation",
     "version",
     "channel",
     "publishedAt",
@@ -19,6 +20,7 @@
   "properties": {
     "$schema": { "type": "string" },
     "schemaVersion": { "type": "integer", "const": 1 },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
     "version": { "$ref": "#/$defs/semver" },
     "channel": { "enum": ["stable", "preview"] },
     "publishedAt": {

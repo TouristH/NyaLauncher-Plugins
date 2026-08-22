@@ -1,0 +1,288 @@
+name: Apply plugin identity lifecycle
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  freeze_purge:
+    if: >-
+      startsWith(github.event.issue.title, '[Lifecycle]') &&
+      startsWith(github.event.comment.body, '/apply-lifecycle ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      operation: ${{ steps.describe.outputs.operation }}
+      staging_pr: ${{ steps.describe.outputs.staging_pr }}
+      staging_sha: ${{ steps.freeze.outputs.staging_sha }}
+      staging_head_ref: ${{ steps.freeze.outputs.staging_head_ref }}
+      staging_author_id: ${{ steps.freeze.outputs.staging_author_id }}
+    steps:
+      - name: Checkout trusted registry main for authorization
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Fail closed until the identity migration is complete
+        run: >-
+          jq -e '.schemaVersion == 2' repository.json >/dev/null ||
+          (echo '::notice::Registry v2 migration is pending; lifecycle writes are disabled' && exit 78)
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Authorize numeric administrator and describe the transaction
+        id: describe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python tools/lifecycle.py describe
+          --event "$GITHUB_EVENT_PATH"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Mint App token only for immediate purge freeze
+        if: steps.describe.outputs.operation == 'purge'
+        id: freeze-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.NYA_REGISTRY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NYA_REGISTRY_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+      - name: Bind and close the purge staging PR before taking the writer lock
+        if: steps.describe.outputs.operation == 'purge'
+        id: freeze
+        env:
+          GH_TOKEN: ${{ steps.freeze-token.outputs.token }}
+          APP_SLUG: ${{ steps.freeze-token.outputs.app-slug }}
+          STAGING_PR: ${{ steps.describe.outputs.staging_pr }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${STAGING_PR}")"
+          EXPECTED_BOT="$(jq -r .registryBotLogin repository.json)"
+          test "${APP_SLUG,,}[bot]" = "${EXPECTED_BOT,,}"
+          jq -e --arg repo "$GITHUB_REPOSITORY" --arg bot "$EXPECTED_BOT" \
+            --argjson repository_id "$REPOSITORY_ID" '
+            (.state == "open" or .state == "closed") and
+            .merged_at == null and
+            .base.ref == "main" and
+            ((.base.repo.full_name // "") | ascii_downcase) == ($repo | ascii_downcase) and
+            .base.repo.id == $repository_id and
+            ((.head.repo.full_name // "") | ascii_downcase) == ($repo | ascii_downcase) and
+            .head.repo.id == $repository_id and
+            ((.user.login // "") | ascii_downcase) == ($bot | ascii_downcase) and
+            .user.type == "Bot" and (.user.id | type == "number") and .user.id > 0
+          ' <<<"$PR_JSON" >/dev/null
+          STAGING_STATE="$(jq -r .state <<<"$PR_JSON")"
+          STAGING_SHA="$(jq -r .head.sha <<<"$PR_JSON")"
+          STAGING_HEAD_REF="$(jq -r .head.ref <<<"$PR_JSON")"
+          STAGING_AUTHOR_ID="$(jq -r .user.id <<<"$PR_JSON")"
+          [[ "$STAGING_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$STAGING_HEAD_REF" = "registry-bot/sync"
+          [[ "$STAGING_AUTHOR_ID" =~ ^[1-9][0-9]*$ ]]
+
+          REF_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${STAGING_HEAD_REF}")"
+          test "$(jq -r .object.sha <<<"$REF_JSON")" = "$STAGING_SHA"
+          OTHER_OPEN_COUNT="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+            -f state=open -f base=main \
+            -f "head=${GITHUB_REPOSITORY_OWNER}:${STAGING_HEAD_REF}" -f per_page=100 | \
+            jq --argjson bound "$STAGING_PR" '[.[] | select(.number != $bound)] | length')"
+          test "$OTHER_OPEN_COUNT" = "0"
+
+          if [ "$STAGING_STATE" = "open" ]; then
+            gh pr close "$STAGING_PR" --repo "$GITHUB_REPOSITORY"
+          fi
+          CLOSED_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${STAGING_PR}")"
+          jq -e --arg sha "$STAGING_SHA" --arg ref "$STAGING_HEAD_REF" \
+            --argjson author_id "$STAGING_AUTHOR_ID" '
+            .state == "closed" and .merged_at == null and
+            .head.sha == $sha and .head.ref == $ref and .user.id == $author_id
+          ' <<<"$CLOSED_JSON" >/dev/null
+          echo "staging_sha=$STAGING_SHA" >> "$GITHUB_OUTPUT"
+          echo "staging_head_ref=$STAGING_HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "staging_author_id=$STAGING_AUTHOR_ID" >> "$GITHUB_OUTPUT"
+
+  lifecycle:
+    needs: freeze_purge
+    if: >-
+      startsWith(github.event.issue.title, '[Lifecycle]') &&
+      startsWith(github.event.comment.body, '/apply-lifecycle ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: registry-write
+      cancel-in-progress: false
+    steps:
+      - name: Checkout trusted registry main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Mint short-lived registry App writer token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.NYA_REGISTRY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NYA_REGISTRY_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Prepare the trusted main or bound purge staging worktree
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPERATION: ${{ needs.freeze_purge.outputs.operation }}
+          STAGING_PR: ${{ needs.freeze_purge.outputs.staging_pr }}
+          EXPECTED_STAGING_SHA: ${{ needs.freeze_purge.outputs.staging_sha }}
+          EXPECTED_STAGING_HEAD_REF: ${{ needs.freeze_purge.outputs.staging_head_ref }}
+          EXPECTED_STAGING_AUTHOR_ID: ${{ needs.freeze_purge.outputs.staging_author_id }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          if [ "$OPERATION" != "purge" ]; then
+            echo "REGISTRY_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            echo "NYA_LIFECYCLE_PUBLIC_REF=origin/main" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${STAGING_PR}")"
+          EXPECTED_BOT="$(jq -r .registryBotLogin repository.json)"
+          jq -e --arg repo "$GITHUB_REPOSITORY" --arg bot "$EXPECTED_BOT" \
+            --argjson repository_id "$REPOSITORY_ID" \
+            --argjson author_id "$EXPECTED_STAGING_AUTHOR_ID" '
+            .state == "closed" and .merged_at == null and
+            .base.ref == "main" and
+            ((.base.repo.full_name // "") | ascii_downcase) == ($repo | ascii_downcase) and
+            .base.repo.id == $repository_id and
+            ((.head.repo.full_name // "") | ascii_downcase) == ($repo | ascii_downcase) and
+            .head.repo.id == $repository_id and
+            ((.user.login // "") | ascii_downcase) == ($bot | ascii_downcase) and
+            .user.type == "Bot" and .user.id == $author_id
+          ' <<<"$PR_JSON" >/dev/null
+          STAGING_SHA="$(jq -r .head.sha <<<"$PR_JSON")"
+          STAGING_HEAD_REF="$(jq -r .head.ref <<<"$PR_JSON")"
+          [[ "$STAGING_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$STAGING_HEAD_REF" = "registry-bot/sync"
+          test "$STAGING_SHA" = "$EXPECTED_STAGING_SHA"
+          test "$STAGING_HEAD_REF" = "$EXPECTED_STAGING_HEAD_REF"
+
+          git fetch --no-tags origin \
+            "refs/heads/${STAGING_HEAD_REF}:refs/remotes/origin/lifecycle-staging"
+          test "$(git rev-parse refs/remotes/origin/lifecycle-staging)" = "$STAGING_SHA"
+          STAGING_ROOT="$RUNNER_TEMP/nya-registry-staging"
+          git worktree add --detach "$STAGING_ROOT" "$STAGING_SHA"
+          echo "REGISTRY_ROOT=$STAGING_ROOT" >> "$GITHUB_ENV"
+          echo "NYA_LIFECYCLE_PUBLIC_REF=origin/main" >> "$GITHUB_ENV"
+          echo "PURGE_STAGING_PR=$STAGING_PR" >> "$GITHUB_ENV"
+          echo "PURGE_STAGING_HEAD_REF=$STAGING_HEAD_REF" >> "$GITHUB_ENV"
+          echo "NYA_PURGE_STAGING_CLOSED_PR=$STAGING_PR" >> "$GITHUB_ENV"
+          echo "NYA_PURGE_STAGING_CLOSED_SHA=$STAGING_SHA" >> "$GITHUB_ENV"
+          echo "NYA_PURGE_STAGING_CLOSED_HEAD_REF=$STAGING_HEAD_REF" >> "$GITHUB_ENV"
+          echo "NYA_PURGE_STAGING_AUTHOR_ID=$EXPECTED_STAGING_AUTHOR_ID" >> "$GITHUB_ENV"
+      - name: Verify author confirmation and apply the bound transaction
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python tools/lifecycle.py apply
+          --event "$GITHUB_EVENT_PATH"
+          --registry-root "$REGISTRY_ROOT"
+          --summary "$GITHUB_WORKSPACE/lifecycle-summary.txt"
+      - name: Rebuild both registry contracts
+        run: >-
+          python tools/validate.py
+          --registry-root "$REGISTRY_ROOT"
+          --write --check
+      - name: Run trusted-base regression tests
+        run: python -m unittest discover -s "$GITHUB_WORKSPACE/tests" -v
+      - name: Stage only lifecycle ledger and generated views
+        run: |
+          git -C "$REGISTRY_ROOT" add -- plugins.json plugins reviews tombstones \
+            plugin_details.json public/v1/index.json public/v2/index.json
+          git -C "$REGISTRY_ROOT" diff --cached --check
+          test -n "$(git -C "$REGISTRY_ROOT" diff --cached --name-only)"
+      - name: Commit, push protected lifecycle branch, and open PR
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BRANCH: registry-bot/lifecycle/issue-${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          git -C "$REGISTRY_ROOT" config user.name "${APP_SLUG}[bot]"
+          git -C "$REGISTRY_ROOT" config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git -C "$REGISTRY_ROOT" -c core.hooksPath=/dev/null commit \
+            -m "chore: apply plugin lifecycle #${{ github.event.issue.number }}"
+
+          AUTH_HEADER="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
+          trap 'git -C "$REGISTRY_ROOT" config --local --unset-all http.https://github.com/.extraheader || true' EXIT
+          git -C "$REGISTRY_ROOT" config --local \
+            http.https://github.com/.extraheader "AUTHORIZATION: basic $AUTH_HEADER"
+          REMOTE_SHA="$(git ls-remote --heads origin "refs/heads/${BRANCH}" | awk '{print $1}')"
+          if [ -n "$REMOTE_SHA" ]; then
+            git -C "$REGISTRY_ROOT" -c core.hooksPath=/dev/null push \
+              --force-with-lease="refs/heads/${BRANCH}:${REMOTE_SHA}" \
+              origin "HEAD:refs/heads/${BRANCH}"
+          else
+            git -C "$REGISTRY_ROOT" -c core.hooksPath=/dev/null push \
+              origin "HEAD:refs/heads/${BRANCH}"
+          fi
+
+          printf 'Lifecycle request #%s\n\n' '${{ github.event.issue.number }}' > lifecycle-pr.md
+          cat lifecycle-summary.txt >> lifecycle-pr.md
+          printf '\n\nCloses #%s\n' '${{ github.event.issue.number }}' >> lifecycle-pr.md
+          PR_DATA="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+            -f state=open -f base=main \
+            -f "head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}" -f per_page=100 | \
+            jq -c --arg repo "$GITHUB_REPOSITORY" --arg bot "${APP_SLUG}[bot]" \
+              '[.[] | select(((.head.repo.full_name // "") | ascii_downcase) == ($repo | ascii_downcase) and ((.user.login // "") | ascii_downcase) == ($bot | ascii_downcase))] | if length == 0 then {} else {number: .[0].number} end')"
+          PR_NUMBER="$(jq -r '.number // empty' <<<"$PR_DATA")"
+          if [ -z "$PR_NUMBER" ]; then
+            PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "chore: apply plugin lifecycle #${{ github.event.issue.number }}" \
+              --body-file lifecycle-pr.md)"
+            PR_NUMBER="$(gh pr view "$PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
+          else
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file lifecycle-pr.md
+          fi
+          PR_STATE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
+          AUTO_MERGE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$PR_STATE" = "OPEN" ] && [ "$AUTO_MERGE" != "true" ]; then
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
+          fi
+
+          for _ in $(seq 1 180); do
+            PR_DATA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json state,mergeStateStatus --jq '.state + " " + .mergeStateStatus')"
+            case "$PR_DATA" in
+              MERGED\ *)
+                if [ -n "${PURGE_STAGING_HEAD_REF:-}" ]; then
+                  gh api --method DELETE \
+                    "repos/${GITHUB_REPOSITORY}/git/refs/heads/${PURGE_STAGING_HEAD_REF}" \
+                    >/dev/null 2>&1 || echo "::warning::Purge staging branch could not be deleted after merge"
+                fi
+                gh api --method DELETE \
+                  "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" >/dev/null 2>&1 || true
+                exit 0
+                ;;
+              CLOSED\ *)
+                echo "::error::Lifecycle PR #${PR_NUMBER} was closed without merging; purge staging branch was retained"
+                exit 1
+                ;;
+              "OPEN BEHIND")
+                gh api --method PUT \
+                  "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/update-branch" >/dev/null
+                ;;
+            esac
+            sleep 10
+          done
+          echo "::error::Timed out waiting for lifecycle PR #${PR_NUMBER}; purge staging branch was retained"
+          exit 1

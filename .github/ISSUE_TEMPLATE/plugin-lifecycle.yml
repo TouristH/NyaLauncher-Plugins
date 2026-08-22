@@ -1,0 +1,73 @@
+name: Plugin lifecycle / 插件身份生命周期
+description: 原作者确认后退役或定向转让 ID；purge 仅处理从未公开的误收录
+title: "[Lifecycle] "
+labels: ["plugin-lifecycle", "pending-review"]
+body:
+  - type: dropdown
+    id: operation
+    attributes:
+      label: 操作 / Operation
+      options:
+        - retire
+        - transfer
+        - purge
+    validations:
+      required: true
+  - type: input
+    id: plugin-id
+    attributes:
+      label: 插件 ID / Plugin ID
+      placeholder: io.github.example.toolbox
+    validations:
+      required: true
+  - type: input
+    id: generation
+    attributes:
+      label: 当前代际 / Current generation
+      description: 必须与 v2 索引当前 generation 完全一致，用于防止旧请求重放。
+      placeholder: "1"
+    validations:
+      required: true
+  - type: input
+    id: source-repository-id
+    attributes:
+      label: 源数字仓库 ID / Source repository ID
+      description: GitHub 不可变数字 repositoryId，不是仓库名称。
+      placeholder: "123456789"
+    validations:
+      required: true
+  - type: input
+    id: target-repository
+    attributes:
+      label: 目标仓库 / Target repository
+      description: 仅 transfer 填写完整 GitHub 仓库 URL；retire/purge 填写 N/A。
+      placeholder: https://github.com/new-owner/new-plugin
+    validations:
+      required: true
+  - type: input
+    id: staging-pr
+    attributes:
+      label: Staging PR 编号 / Staging PR number
+      description: 仅 purge 填写仍 open、head 为 registry-bot/sync 的单插件机器人 PR 编号；retire/transfer 填写 N/A。
+      placeholder: "123"
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: 原因 / Reason
+      description: 会写入撤回记录、生命周期 PR 或 purge 墓碑；不要包含漏洞利用细节。
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        管理员不会仅凭本 Issue 转让 ID。用户仓库的数字 owner 必须先在本 Issue 评论精确确认：
+
+        - retire：`/confirm-retire id@gN source:SOURCE_REPOSITORY_ID`
+        - transfer：`/confirm-transfer id@gN source:SOURCE_REPOSITORY_ID target:TARGET_REPOSITORY_ID`
+
+        组织仓库改为在源仓库默认分支根目录提交 `_nyalauncher_lifecycle.json` 固定确认文件。
+        管理员随后使用包含 expected generation 和数字仓库 ID 的 `/apply-lifecycle ...` 命令。
+        purge 还必须绑定未合并的单插件机器人 PR：
+        `/apply-lifecycle purge id@gN source:SOURCE_REPOSITORY_ID staging-pr:PR_NUMBER`。

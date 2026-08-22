@@ -8,9 +8,11 @@
   "items": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["id", "repositoryUrl", "repositoryId", "ownerId"],
+    "required": ["id", "lineageId", "generation", "repositoryUrl", "repositoryId", "ownerId"],
     "properties": {
       "id": { "$ref": "#/$defs/pluginId" },
+      "lineageId": { "$ref": "#/$defs/lineageId" },
+      "generation": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
       "repositoryUrl": { "$ref": "#/$defs/githubRepository" },
       "repositoryId": {
         "type": "integer",
@@ -29,6 +31,10 @@
       "type": "string",
       "maxLength": 128,
       "pattern": "^[a-z][a-z0-9]*(?:\\.[a-z0-9][a-z0-9-]*)+$"
+    },
+    "lineageId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
     },
     "githubRepository": {
       "type": "string",

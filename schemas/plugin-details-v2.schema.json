@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/TouristH/NyaLauncher-Plugins/main/schemas/plugin-details-v2.schema.json",
+  "title": "NyaLauncher generated identity-aware plugin details v2",
+  "description": "Internal deterministic view with frozen metadata for every publisher generation; reviews are attached only to public indexes.",
+  "type": "array",
+  "maxItems": 2048,
+  "items": { "$ref": "#/$defs/plugin" },
+  "$defs": {
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "name", "description", "authors", "repositoryUrl", "maintainers",
+        "categories", "license", "lineageId", "generation", "lifecycleStatus",
+        "visibility", "publisher", "generations", "lifecycleEvents",
+        "generationMetadata", "releases"
+      ],
+      "properties": {
+        "id": { "$ref": "index-v2.schema.json#/$defs/pluginId" },
+        "name": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/name" },
+        "description": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/description" },
+        "authors": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/authors" },
+        "repositoryUrl": { "$ref": "index-v2.schema.json#/$defs/githubRepository" },
+        "maintainers": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/maintainers" },
+        "categories": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/categories" },
+        "license": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/license" },
+        "lineageId": { "$ref": "index-v2.schema.json#/$defs/lineageId" },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "lifecycleStatus": { "enum": ["active", "retired", "transferred"] },
+        "visibility": { "enum": ["listed", "hidden"] },
+        "publisher": { "$ref": "index-v2.schema.json#/$defs/publisher" },
+        "generations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "plugin-identity-v1.schema.json#/$defs/generation" }
+        },
+        "lifecycleEvents": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "plugin-identity-v1.schema.json#/$defs/event" }
+        },
+        "generationMetadata": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/generationMetadata" }
+        },
+        "releases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": { "$ref": "index-v2.schema.json#/$defs/release" }
+        }
+      }
+    },
+    "generationMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generation", "id", "name", "description", "authors", "repositoryUrl",
+        "maintainers", "categories", "license"
+      ],
+      "properties": {
+        "generation": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "id": { "$ref": "index-v2.schema.json#/$defs/pluginId" },
+        "name": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/name" },
+        "description": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/description" },
+        "authors": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/authors" },
+        "repositoryUrl": { "$ref": "index-v2.schema.json#/$defs/githubRepository" },
+        "maintainers": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/maintainers" },
+        "categories": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/categories" },
+        "license": { "$ref": "index-v2.schema.json#/$defs/plugin/properties/license" }
+      }
+    }
+  }
+}

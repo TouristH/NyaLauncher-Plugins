@@ -30,18 +30,26 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_ACTOR: ${{ github.event.pull_request.user.login }}
+          PR_ACTOR_ID: ${{ github.event.pull_request.user.id }}
+          PR_ACTOR_TYPE: ${{ github.event.pull_request.user.type }}
           BASE_REPOSITORY: ${{ github.repository }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           EVENT_SENDER: ${{ github.event.sender.login }}
+          EVENT_SENDER_ID: ${{ github.event.sender.id }}
+          EVENT_SENDER_TYPE: ${{ github.event.sender.type }}
           EVENT_ACTION: ${{ github.event.action }}
         run: >-
           python tools/check_pr.py
           --base "$BASE_SHA"
           --head refs/remotes/origin/policy-head
           --actor "$PR_ACTOR"
+          --actor-id "$PR_ACTOR_ID"
+          --actor-type "$PR_ACTOR_TYPE"
           --base-repository "$BASE_REPOSITORY"
           --head-repository "$HEAD_REPOSITORY"
           --head-ref "$HEAD_REF"
           --event-sender "$EVENT_SENDER"
+          --event-sender-id "$EVENT_SENDER_ID"
+          --event-sender-type "$EVENT_SENDER_TYPE"
           --event-action "$EVENT_ACTION"

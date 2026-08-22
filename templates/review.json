@@ -1,11 +1,13 @@
 {
   "$schema": "../../schemas/review-v1.schema.json",
   "schemaVersion": 1,
+  "generation": 1,
   "pluginId": "io.github.example.toolbox",
   "version": "1.0.0",
   "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "status": "verified",
   "stateBy": "TouristH",
+  "stateById": 143396778,
   "stateAt": "2026-08-13T00:00:00Z",
   "lastCommandAt": "2026-08-13T00:00:00Z",
   "lastCommentId": 123456789,
