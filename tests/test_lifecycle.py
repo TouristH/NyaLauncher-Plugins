@@ -47,7 +47,7 @@ def release(*, generation: int = 1, repository_url: str = SOURCE_URL) -> dict:
             "manifestVersion": 1,
             "apiVersion": "1.0",
             "minimumLauncherVersion": (
-                "0.1.0" if generation == 1 else "0.1.2-testplug.1"
+                "0.1.0" if generation == 1 else "1.0.0-preview1"
             ),
         },
         "requiredCapabilities": [],
@@ -134,7 +134,7 @@ class LifecycleFixture:
                 "launcherUrl": "https://github.com/redstore-noob/NyaLauncher",
                 "indexPath": "public/v1/index.json",
                 "indexV2Path": "public/v2/index.json",
-                "v2MinimumLauncherVersion": "0.1.2-testplug.1",
+                "v2MinimumLauncherVersion": "1.0.0-preview1",
                 "registryBotLogin": "nyalauncher-registry-bot[bot]",
                 "trustedReviewers": ["RegistryAdmin"],
                 "trustedReviewerIds": {"RegistryAdmin": ADMIN_ID},

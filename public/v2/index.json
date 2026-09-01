@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "name": "NyaLauncher Plugins",
   "sourceUrl": "https://github.com/TouristH/NyaLauncher-Plugins",
-  "minimumLauncherVersion": "0.1.2-testplug.1",
+  "minimumLauncherVersion": "1.0.0-preview1",
   "plugins": [
     {
       "id": "io.github.touristh.clock",

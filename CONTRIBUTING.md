@@ -7,7 +7,7 @@
 ## 1. 准备插件包
 
 请先阅读
-[NyaLauncher 第三方插件开发规范（API v1）](https://github.com/redstore-noob/NyaLauncher/blob/testplug/NyaLauncher.Plugin.Abstractions/README.md)。
+[NyaLauncher 第三方插件开发规范（API v1）](https://github.com/redstore-noob/NyaLauncher/blob/main/NyaLauncher.Plugin.Abstractions/README.md)。
 
 发行 ZIP 必须满足：
 
