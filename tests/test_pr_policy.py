@@ -942,7 +942,7 @@ class PullRequestPolicyTests(unittest.TestCase):
                 **base_repository,
                 "schemaVersion": 2,
                 "indexV2Path": "public/v2/index.json",
-                "v2MinimumLauncherVersion": "0.1.2-testplug.1",
+                "v2MinimumLauncherVersion": "1.0.0-preview1",
                 "trustedReviewerIds": {"TouristH": 143396778},
             }
             head_listing = {

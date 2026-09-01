@@ -1,13 +1,13 @@
 # NyaLauncher 插件中心
 
 [![Validate registry](https://github.com/TouristH/NyaLauncher-Plugins/actions/workflows/validate.yml/badge.svg)](https://github.com/TouristH/NyaLauncher-Plugins/actions/workflows/validate.yml)
-[![NyaLauncher](https://img.shields.io/badge/NyaLauncher-testplug-7c4dff)](https://github.com/redstore-noob/NyaLauncher/tree/testplug)
+[![NyaLauncher](https://img.shields.io/badge/NyaLauncher-main-7c4dff)](https://github.com/redstore-noob/NyaLauncher)
 
 NyaLauncher 的独立社区插件索引。插件代码和安装包仍由作者自己的 GitHub 仓库托管，
 本仓库只负责收录来源、保存不可变版本历史、验证发行包并生成启动器读取的静态索引。
 
 插件开发规范以
-[NyaLauncher Plugin Abstractions（testplug）](https://github.com/redstore-noob/NyaLauncher/blob/testplug/NyaLauncher.Plugin.Abstractions/README.md)
+[NyaLauncher Plugin Abstractions（API v1）](https://github.com/redstore-noob/NyaLauncher/blob/main/NyaLauncher.Plugin.Abstractions/README.md)
 为准。
 
 > 收录不等于代码安全审核。插件是与启动器同进程运行的 .NET 代码，能力授权不是操作系统沙箱。

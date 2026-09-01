@@ -6,7 +6,7 @@
   "launcherUrl": "https://github.com/redstore-noob/NyaLauncher",
   "indexPath": "public/v1/index.json",
   "indexV2Path": "public/v2/index.json",
-  "v2MinimumLauncherVersion": "0.1.2-testplug.1",
+  "v2MinimumLauncherVersion": "1.0.0-preview1",
   "registryBotLogin": "nyalauncher-registry-bot[bot]",
   "trustedReviewers": [
     "TouristH",

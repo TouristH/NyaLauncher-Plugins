@@ -2284,7 +2284,7 @@ def load_repository_configuration() -> tuple[dict, set[str]]:
         )
     else:
         value["indexV2Path"] = "public/v2/index.json"
-        value["v2MinimumLauncherVersion"] = "0.1.2-testplug.1"
+        value["v2MinimumLauncherVersion"] = "1.0.0-preview1"
     bot_login = require_text(path, "registryBotLogin", value["registryBotLogin"], 44)
     if GITHUB_APP_BOT_LOGIN.fullmatch(bot_login) is None:
         raise ValidationFailure("repository.json: registryBotLogin 必须是 GitHub App [bot] 登录名")
